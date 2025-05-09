@@ -1,0 +1,2227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Speech Recognition</title>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <script src="https://unpkg.com/@supabase/supabase-js@2"></script>
+    <script>
+        // Initialize Supabase configuration
+        window.SUPABASE_CONFIG = {
+            url: '<%= process.env.SUPABASE_URL %>',
+            key: '<%= process.env.SUPABASE_ANON_KEY %>'
+        };
+
+        // Initialize Supabase client at the very top
+        const supabase = window.supabase.createClient(
+            window.SUPABASE_CONFIG.url,
+            window.SUPABASE_CONFIG.key,
+            {
+                auth: {
+                    autoRefreshToken: true,
+                    persistSession: true,
+                    detectSessionInUrl: true
+                }
+            }
+        );
+
+        // Add a function to ensure Supabase is initialized
+        async function ensureSupabaseInitialized() {
+            if (!supabase) {
+                console.error('Supabase client not initialized');
+                throw new Error('Supabase client not initialized');
+            }
+            return supabase;
+        }
+
+        console.log('Supabase client initialized with config:', {
+            hasUrl: !!window.SUPABASE_CONFIG.url,
+            hasKey: !!window.SUPABASE_CONFIG.key,
+            urlLength: window.SUPABASE_CONFIG.url?.length,
+            keyLength: window.SUPABASE_CONFIG.key?.length
+        });
+
+        // Check for existing session on page load
+        supabase.auth.getSession().then(({ data: { session }, error }) => {
+            console.log('Initial session check:', {
+                hasSession: !!session,
+                hasError: !!error,
+                errorMessage: error?.message,
+                userEmail: session?.user?.email
+            });
+            
+            if (error) {
+                console.error('Error getting session:', error);
+                return;
+            }
+            if (session) {
+                console.log('Found existing session');
+                currentUser = session.user;
+                document.getElementById('authContainer').style.display = 'none';
+                document.getElementById('mainContent').style.display = 'block';
+                updateUserProfile(session.user);
+            } else {
+                console.log('No existing session');
+                document.getElementById('authContainer').style.display = 'flex';
+                document.getElementById('mainContent').style.display = 'none';
+            }
+        });
+
+        // Global variables - declare these only once at the top level
+        let currentUser = null;
+        let ws = null;
+        let fullTranscript = [];
+        let meetingStartTime = new Date();
+        window.speakerNames = new Map();
+
+        // Add a global variable to store the current session
+        let currentSession = null;
+
+        // Wait for DOM to be fully loaded
+        document.addEventListener('DOMContentLoaded', () => {
+            // Auth form handling
+            let isSignUp = false;
+            const authForm = document.getElementById('authForm');
+            const authToggleBtn = document.getElementById('authToggleBtn');
+            const authTitle = document.getElementById('authTitle');
+            const authToggleText = document.getElementById('authToggleText');
+            const authSubmit = document.getElementById('authSubmit');
+            const authError = document.getElementById('authError');
+
+            // Settings menu functionality
+            const settingsCog = document.getElementById('settingsCog');
+            const settingsDropdown = document.querySelector('.settings-dropdown');
+            const logoutBtn = document.getElementById('logoutBtn');
+
+            if (settingsCog) {
+                settingsCog.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    settingsDropdown.classList.toggle('show');
+                });
+            }
+
+            // Close dropdown when clicking outside
+            document.addEventListener('click', (e) => {
+                if (!settingsCog?.contains(e.target) && !settingsDropdown?.contains(e.target)) {
+                    settingsDropdown?.classList.remove('show');
+                }
+            });
+
+            if (logoutBtn) {
+                logoutBtn.addEventListener('click', async (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    try {
+                        console.log('Attempting to sign out...');
+                        
+                        // Simple sign out
+                        const { error } = await supabase.auth.signOut();
+                        if (error) throw error;
+                        
+                        console.log('Successfully signed out');
+                        
+                        // Clear UI state
+                        currentUser = null;
+                        currentSession = null;
+                        document.getElementById('authContainer').style.display = 'flex';
+                        document.getElementById('mainContent').style.display = 'none';
+                        
+                        // Redirect to sign in page
+                        window.location.href = '/';
+                        
+                    } catch (error) {
+                        console.error('Error signing out:', error);
+                        alert('Error signing out. Please try again.');
+                    }
+                });
+            }
+
+            // Recording elements
+            const startRecordBtn = document.getElementById('startRecord');
+            const stopRecordBtn = document.getElementById('stopRecord');
+            const saveTranscriptBtn = document.getElementById('saveTranscript');
+            const recordingStatus = document.getElementById('recordingStatus');
+            const transcriptSection = document.getElementById('transcriptSection');
+            const transcript = document.getElementById('transcript');
+            const qaSection = document.getElementById('qaSection');
+            const askButton = document.getElementById('askButton');
+
+            // Fix the auth toggle button
+            if (authToggleBtn) {
+                authToggleBtn.addEventListener('click', () => {
+                    isSignUp = !isSignUp;
+                    authTitle.textContent = isSignUp ? 'Sign Up' : 'Sign In';
+                    authSubmit.textContent = isSignUp ? 'Sign Up' : 'Sign In';
+                    authToggleText.textContent = isSignUp ? 'Already have an account?' : "Don't have an account?";
+                    authToggleBtn.textContent = isSignUp ? 'Sign In' : 'Sign Up';
+                    authError.style.display = 'none';
+                });
+            }
+
+            // Auth form submission
+            if (authForm) {
+                authForm.addEventListener('submit', async (e) => {
+                    e.preventDefault();
+                    const email = document.getElementById('authEmail').value;
+                    const password = document.getElementById('authPassword').value;
+
+                    try {
+                        if (isSignUp) {
+                            console.log('Starting sign up process...');
+                            const { data, error } = await supabase.auth.signUp({
+                                email,
+                                password,
+                                options: {
+                                    data: {
+                                        name: email.split('@')[0]
+                                    }
+                                }
+                            });
+                            
+                            if (error) {
+                                console.error('Sign up error:', error);
+                                throw error;
+                            }
+                            
+                            console.log('Auth sign up successful:', data);
+                            
+                            // Create user record in our users table
+                            if (data.user) {
+                                try {
+                                    console.log('Creating user record for:', data.user.id);
+                                    
+                                    // Create new user record directly without checking first
+                                    const { data: userData, error: userError } = await supabase
+                                        .from('users')
+                                        .insert([{
+                                            id: data.user.id,
+                                            email: data.user.email,
+                                            name: data.user.email.split('@')[0],
+                                            created_at: new Date().toISOString()
+                                        }])
+                                        .select()
+                                        .single();
+                                    
+                                    if (userError) {
+                                        console.error('Error creating user record:', userError);
+                                        // If it's an RLS error, the user might already exist
+                                        if (userError.code === '42501') {
+                                            console.log('RLS policy violation - user might already exist');
+                                            authError.textContent = 'Account created successfully! Please check your email for verification.';
+                                            authError.style.display = 'block';
+                                            authError.style.color = '#4CAF50';
+                                        } else {
+                                            authError.textContent = 'Account created but profile setup failed. Please try logging in.';
+                                            authError.style.display = 'block';
+                                            authError.style.color = '#ff9800';
+                                        }
+                                    } else {
+                                        console.log('User record created successfully:', userData);
+                                        authError.textContent = 'Account created successfully! Please check your email for verification.';
+                                        authError.style.display = 'block';
+                                        authError.style.color = '#4CAF50';
+                                    }
+                                } catch (userError) {
+                                    console.error('Error in user creation:', userError);
+                                    // Even if user creation fails, the auth signup was successful
+                                    authError.textContent = 'Account created successfully! Please check your email for verification.';
+                                    authError.style.display = 'block';
+                                    authError.style.color = '#4CAF50';
+                                }
+                            }
+                        } else {
+                            const { data, error } = await supabase.auth.signInWithPassword({
+                                email,
+                                password
+                            });
+                            if (error) throw error;
+                            
+                            // Ensure we have a session after sign in
+                            const { data: { session }, error: sessionError } = await supabase.auth.getSession();
+                            if (sessionError) throw sessionError;
+                            
+                            if (session) {
+                                console.log('Successfully signed in with session');
+                                currentUser = session.user;
+                                currentSession = session;
+                                document.getElementById('authContainer').style.display = 'none';
+                                document.getElementById('mainContent').style.display = 'block';
+                                updateUserProfile(session.user);
+                            }
+                        }
+                    } catch (error) {
+                        console.error('Auth error:', error);
+                        authError.textContent = error.message || 'An error occurred during authentication';
+                        authError.style.display = 'block';
+                        authError.style.color = '#f44336';
+                    }
+                });
+            }
+
+            // Recording functionality
+            if (startRecordBtn) {
+                startRecordBtn.addEventListener('click', async () => {
+                    try {
+                        console.log('Start recording button clicked');
+                        
+                        // Check if we have a stored session
+                        if (!currentSession) {
+                            console.error('No stored session found');
+                            throw new Error('No active session found. Please log in again.');
+                        }
+
+                        console.log('Using stored session:', {
+                            userEmail: currentSession.user.email,
+                            userId: currentSession.user.id,
+                            accessToken: currentSession.access_token ? 'Present' : 'Missing'
+                        });
+
+                        // Store the session for later use
+                        currentUser = currentSession.user;
+                        console.log('Session validated, proceeding with recording setup');
+
+                        // Request microphone access
+                        console.log('Requesting microphone access...');
+                        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                        console.log('Microphone access granted');
+
+                        // Start the recording process
+                        console.log('Starting new recording...');
+                        startNewRecording();
+                        startMeeting();
+                        
+                        // Update UI
+                        console.log('Updating UI for recording state...');
+                        startRecordBtn.style.display = 'none';
+                        stopRecordBtn.style.display = 'inline-flex';
+                        saveTranscriptBtn.style.display = 'none';
+                        recordingStatus.innerHTML = `
+                            <div class="recording-indicator" style="display: inline-block;"></div>
+                            Recording...
+                        `;
+                        transcript.innerHTML = 'Listening...';
+                        transcriptSection.style.display = 'block';
+                        qaSection.style.display = 'none';
+                        
+                        console.log('Recording started successfully');
+                    } catch (error) {
+                        console.error('Error in start recording process:', error);
+                        alert('Error: ' + error.message);
+                        
+                        // Reset UI in case of error
+                        startRecordBtn.style.display = 'inline-flex';
+                        stopRecordBtn.style.display = 'none';
+                        saveTranscriptBtn.style.display = 'none';
+                        recordingStatus.innerHTML = '';
+                    }
+                });
+            }
+
+            if (stopRecordBtn) {
+                stopRecordBtn.addEventListener('click', async () => {
+                    if (ws) {
+                        try {
+                            console.log('Stop recording button clicked');
+                            recordingStatus.innerHTML = 'Stopping recording and saving transcript...';
+
+                            // First close the WebSocket connection
+                            console.log('Closing WebSocket connection...');
+                            ws.onmessage = null;
+                            ws.onerror = null;
+                            ws.onclose = null;
+                            ws.close();
+                            ws = null;
+
+                            // Wait a moment to ensure all messages are processed
+                            await new Promise(resolve => setTimeout(resolve, 1000));
+
+                            // Save the transcript directly
+                            if (fullTranscript && fullTranscript.length > 0) {
+                                try {
+                                    if (!currentSession) {
+                                        throw new Error('No active session found. Please log in again.');
+                                    }
+
+                                    console.log('Preparing transcript data...');
+                                    const transcriptText = fullTranscript
+                                        .map(line => `${line.displayName}: ${line.text}`)
+                                        .join('\n');
+
+                                    console.log('Current session:', {
+                                        user: currentSession.user,
+                                        accessToken: currentSession.access_token ? 'Present' : 'Missing'
+                                    });
+
+                                    const requestBody = {
+                                        id: currentSession.user.id,
+                                        title: `Meeting ${new Date().toLocaleString()}`,
+                                        content: transcriptText,
+                                        duration: Math.round((new Date() - meetingStartTime) / 1000),
+                                        speaker_count: new Set(fullTranscript.map(t => t.speakerId)).size,
+                                        summary: ''
+                                    };
+
+                                    console.log('Saving transcript with data:', {
+                                        id: currentSession.user.id,
+                                        title: requestBody.title,
+                                        contentLength: requestBody.content.length,
+                                        duration: requestBody.duration,
+                                        speakerCount: requestBody.speaker_count,
+                                        hasAccessToken: !!currentSession.access_token
+                                    });
+
+                                    console.log('Saving transcript to database...');
+                                    const response = await fetch('/api/transcripts', {
+                                        method: 'POST',
+                                        headers: {
+                                            'Content-Type': 'application/json',
+                                            'Authorization': `Bearer ${currentSession.access_token}`
+                                        },
+                                        body: JSON.stringify(requestBody)
+                                    });
+
+                                    const result = await response.json();
+                                    
+                                    if (response.ok) {
+                                        console.log('Transcript saved successfully:', result);
+                                        alert('Transcript saved successfully!');
+                                    } else {
+                                        console.error('Failed to save transcript:', result);
+                                        throw new Error(result.error || 'Failed to save transcript');
+                                    }
+                                } catch (error) {
+                                    console.error('Error saving transcript:', error);
+                                    alert('Error saving transcript: ' + error.message);
+                                }
+                            } else {
+                                console.log('No transcript content to save');
+                                alert('No transcript content to save');
+                            }
+
+                            // Update UI
+                            console.log('Updating UI...');
+                            const startRecordBtn = document.getElementById('startRecord');
+                            const stopRecordBtn = document.getElementById('stopRecord');
+                            const saveTranscriptBtn = document.getElementById('saveTranscript');
+                            
+                            if (startRecordBtn) startRecordBtn.style.display = 'inline-flex';
+                            if (stopRecordBtn) stopRecordBtn.style.display = 'none';
+                            if (saveTranscriptBtn) saveTranscriptBtn.style.display = 'none';
+                            recordingStatus.innerHTML = '';
+                            
+                            console.log('Recording stopped and UI updated');
+                        } catch (error) {
+                            console.error('Error in stop recording process:', error);
+                            alert('Error stopping recording: ' + error.message);
+                            
+                            // Force UI update even if there's an error
+                            const startRecordBtn = document.getElementById('startRecord');
+                            const stopRecordBtn = document.getElementById('stopRecord');
+                            const saveTranscriptBtn = document.getElementById('saveTranscript');
+                            
+                            if (startRecordBtn) startRecordBtn.style.display = 'inline-flex';
+                            if (stopRecordBtn) stopRecordBtn.style.display = 'none';
+                            if (saveTranscriptBtn) saveTranscriptBtn.style.display = 'none';
+                            recordingStatus.innerHTML = '';
+                        }
+                    }
+                });
+            }
+
+            // Save transcript functionality
+            if (saveTranscriptBtn) {
+                saveTranscriptBtn.removeEventListener('click', () => {});
+            }
+
+            if (askButton) {
+                askButton.addEventListener('click', async () => {
+                    const question = document.getElementById('questionInput').value.trim();
+                    const answerDiv = document.getElementById('answer');
+                    
+                    if (!question) {
+                        alert('Please enter a question');
+                        return;
+                    }
+                    
+                    try {
+                        answerDiv.innerHTML = 'Thinking...';
+                        answerDiv.className = 'answer-box active';
+                        
+                        const transcriptText = fullTranscript
+                            .map(line => `${line.displayName}: ${line.text}`)
+                            .join('\n');
+                        
+                        const answer = await askQuestion(question, transcriptText);
+                        answerDiv.innerHTML = answer;
+                    } catch (error) {
+                        answerDiv.innerHTML = 'Sorry, I had trouble answering that question. Please try again.';
+                        console.error('Error:', error);
+                    }
+                });
+            }
+
+            // Navigation setup
+            document.querySelectorAll('.nav-item').forEach(item => {
+                item.addEventListener('click', () => {
+                    document.querySelectorAll('.nav-item').forEach(nav => {
+                        nav.classList.remove('active');
+                    });
+                    item.classList.add('active');
+
+                    const viewId = `${item.dataset.view}-view`;
+                    document.querySelectorAll('.content-view').forEach(view => {
+                        view.classList.remove('active');
+                    });
+                    
+                    const targetView = document.getElementById(viewId);
+                    if (targetView) {
+                        targetView.classList.add('active');
+                    }
+                });
+            });
+
+            // Calendar view setup
+            document.querySelector('[data-view="calendar"]')?.addEventListener('click', () => {
+                initializeCalendar();
+                loadMeetings();
+            });
+
+            document.querySelectorAll('.calendar-view-selector button').forEach(button => {
+                button.addEventListener('click', () => {
+                    document.querySelectorAll('.calendar-view-selector button').forEach(b => b.classList.remove('active'));
+                    button.classList.add('active');
+                });
+            });
+
+            // Auth state management
+            supabase.auth.onAuthStateChange(async (event, session) => {
+                console.log('Auth state changed:', {
+                    event,
+                    hasSession: !!session,
+                    userEmail: session?.user?.email,
+                    userId: session?.user?.id,
+                    accessToken: session?.access_token ? 'Present' : 'Missing',
+                    refreshToken: session?.refresh_token ? 'Present' : 'Missing'
+                });
+                
+                if (event === 'SIGNED_OUT' || !session) {
+                    console.log('Handling sign out...');
+                    currentUser = null;
+                    currentSession = null;
+                    document.getElementById('authContainer').style.display = 'flex';
+                    document.getElementById('mainContent').style.display = 'none';
+                } else if (session) {
+                    console.log('Handling sign in...');
+                    currentUser = session.user;
+                    currentSession = session;
+                    document.getElementById('authContainer').style.display = 'none';
+                    document.getElementById('mainContent').style.display = 'block';
+                    updateUserProfile(session.user);
+                    
+                    // Check if user exists in our users table
+                    try {
+                        console.log('Checking user record for:', session.user.id);
+                        const { data: userData, error: userError } = await supabase
+                            .from('users')
+                            .select('*')
+                            .eq('id', session.user.id)
+                            .single();
+
+                        if (userError) {
+                            console.error('Error checking user record:', userError);
+                        }
+
+                        if (!userData) {
+                            console.log('Creating new user record...');
+                            // Create user record if it doesn't exist
+                            const { data: newUser, error: createError } = await supabase
+                                .from('users')
+                                .insert([{
+                                    id: session.user.id,
+                                    email: session.user.email,
+                                    name: session.user.email.split('@')[0]
+                                }])
+                                .select()
+                                .single();
+                            
+                            if (createError) {
+                                console.error('Error creating user record:', createError);
+                            } else {
+                                console.log('User record created successfully:', newUser);
+                            }
+                        } else {
+                            console.log('Existing user record found:', userData);
+                        }
+                    } catch (error) {
+                        console.error('Error in user record management:', error);
+                    }
+                    
+                    loadPastTranscripts();
+                    loadMeetings();
+                }
+            });
+        });
+
+        // Reset transcript and start new recording
+        function startNewRecording() {
+            console.log('Starting new recording, resetting fullTranscript');
+            fullTranscript = [];  // Initialize as empty array
+            meetingStartTime = new Date();
+            console.log('fullTranscript after reset:', fullTranscript);
+        }
+
+        // User profile management
+        function updateUserProfile(user) {
+            const profileSection = document.querySelector('.profile-section');
+            if (profileSection) {
+                const nameElement = profileSection.querySelector('.profile-name');
+                const emailElement = profileSection.querySelector('.profile-email');
+                if (nameElement) nameElement.textContent = user.email.split('@')[0];
+                if (emailElement) emailElement.textContent = user.email;
+            }
+        }
+
+        // Load past transcripts from Supabase
+        async function loadPastTranscripts() {
+            try {
+                const { data: { session } } = await supabase.auth.getSession();
+                if (!session) return;
+
+                const { data: transcripts, error } = await supabase
+                    .from('transcripts')
+                    .select('*')
+                    .order('created_at', { ascending: false });
+
+                if (error) throw error;
+
+                const transcriptsList = document.getElementById('transcriptsList');
+                if (transcriptsList) {
+                    transcriptsList.innerHTML = transcripts.map(transcript => `
+                        <div class="transcript-item">
+                            <h3>${transcript.title}</h3>
+                            <p>${transcript.content}</p>
+                            <small>${new Date(transcript.created_at).toLocaleString()}</small>
+                        </div>
+                    `).join('');
+                }
+            } catch (error) {
+                console.error('Error loading transcripts:', error);
+            }
+        }
+
+        // Meeting management
+        function startMeeting() {
+            if (!ws) {
+                try {
+                    ws = new WebSocket('ws://localhost:3000');
+                    
+                    ws.onopen = () => {
+                        console.log('WebSocket connection established');
+                        startNewRecording();
+                        // Show the transcript and Q&A sections when connection is established
+                        const transcriptSection = document.getElementById('transcriptSection');
+                        const qaSection = document.getElementById('qaSection');
+                        if (transcriptSection) transcriptSection.style.display = 'block';
+                        if (qaSection) qaSection.style.display = 'block';
+                    };
+
+                    ws.onmessage = (event) => {
+                        if (!ws) return; // Don't process messages if connection is closed
+                        
+                        try {
+                            console.log('Received WebSocket message:', event.data);
+                            const data = JSON.parse(event.data);
+                            console.log('Parsed WebSocket data:', data);
+                            
+                            // Skip empty messages
+                            if (!data.text || data.text.trim() === '') {
+                                console.log('Skipping empty message');
+                                return;
+                            }
+                            
+                            // Ensure data has the required fields
+                            if (data.speakerId) {
+                                // Add type if not present
+                                if (!data.type) {
+                                    data.type = 'final';
+                                }
+                                updateTranscriptionUI(data);
+                            } else {
+                                console.warn('Received incomplete transcript data:', data);
+                            }
+                        } catch (error) {
+                            console.error('Error processing WebSocket message:', error);
+                        }
+                    };
+
+                    ws.onclose = () => {
+                        console.log('WebSocket connection closed');
+                        ws = null;
+                        
+                        // Don't hide the sections on close, just update the UI
+                        const transcriptSection = document.getElementById('transcriptSection');
+                        const qaSection = document.getElementById('qaSection');
+                        if (transcriptSection) transcriptSection.style.display = 'block';
+                        if (qaSection) qaSection.style.display = 'block';
+                    };
+
+                    ws.onerror = (error) => {
+                        console.error('WebSocket error:', error);
+                        ws = null;
+                    };
+                } catch (error) {
+                    console.error('Error creating WebSocket:', error);
+                    ws = null;
+                }
+            }
+        }
+
+        // Load meetings from Supabase
+        async function loadMeetings() {
+            try {
+                const { data: { session } } = await supabase.auth.getSession();
+                if (!session) return;
+
+                const { data: meetings, error } = await supabase
+                    .from('meetings')
+                    .select('*')
+                    .order('created_at', { ascending: false });
+
+                if (error) throw error;
+
+                const meetingsList = document.getElementById('meetingsList');
+                if (meetingsList) {
+                    meetingsList.innerHTML = meetings.map(meeting => `
+                        <div class="meeting-item">
+                            <h3>${meeting.title}</h3>
+                            <p>${meeting.description || ''}</p>
+                            <small>${new Date(meeting.created_at).toLocaleString()}</small>
+                        </div>
+                    `).join('');
+                }
+            } catch (error) {
+                console.error('Error loading meetings:', error);
+            }
+        }
+
+        // Update transcription UI
+        function updateTranscriptionUI(data) {
+            const transcript = document.getElementById('transcript');
+            if (!transcript) return;
+
+            console.log('Updating transcription UI with data:', data);
+
+            // Initialize fullTranscript if it doesn't exist
+            if (!fullTranscript) {
+                console.log('Initializing fullTranscript array');
+                fullTranscript = [];
+            }
+
+            // Skip empty messages
+            if (!data.text || data.text.trim() === '') {
+                console.log('Skipping empty message in updateTranscriptionUI');
+                return;
+            }
+
+            const speakerName = data.speakerId === 'Unknown' ? 'Unknown Speaker' : data.speakerId;
+            const transcriptEntry = {
+                speakerId: data.speakerId,
+                displayName: speakerName,
+                text: data.text,
+                timestamp: new Date().toISOString(),
+                type: data.type
+            };
+
+            if (data.type === 'interim') {
+                // Update interim transcription
+                const interimSpan = document.getElementById('interim-transcription');
+                if (interimSpan) {
+                    interimSpan.textContent = data.text;
+                }
+                
+                // Add interim to fullTranscript if it's not already there
+                const existingInterimIndex = fullTranscript.findIndex(
+                    entry => entry.type === 'interim' && entry.speakerId === data.speakerId
+                );
+                
+                if (existingInterimIndex !== -1) {
+                    // Update existing interim entry
+                    fullTranscript[existingInterimIndex] = transcriptEntry;
+                } else {
+                    // Add new interim entry
+                    fullTranscript.push(transcriptEntry);
+                }
+                console.log('Updated interim in fullTranscript:', transcriptEntry);
+            } else if (data.type === 'final') {
+                console.log('Processing final transcription');
+                // Add final transcription to the transcript
+                const transcriptLine = document.createElement('div');
+                transcriptLine.className = 'transcript-line';
+                transcriptLine.innerHTML = `
+                    <span class="speaker-name" data-speaker-id="${data.speakerId}">${speakerName}:</span>
+                    <span class="transcript-text">${data.text}</span>
+                `;
+                transcript.appendChild(transcriptLine);
+                
+                // Clear interim transcription
+                const interimSpan = document.getElementById('interim-transcription');
+                if (interimSpan) {
+                    interimSpan.textContent = '';
+                }
+
+                // Remove any interim entries for this speaker
+                fullTranscript = fullTranscript.filter(
+                    entry => !(entry.type === 'interim' && entry.speakerId === data.speakerId)
+                );
+
+                // Add final entry
+                fullTranscript.push(transcriptEntry);
+                console.log('Added final to fullTranscript:', transcriptEntry);
+            }
+
+            console.log('Current fullTranscript:', fullTranscript);
+            console.log('Current fullTranscript length:', fullTranscript.length);
+
+            // Scroll to bottom of transcript
+            transcript.scrollTop = transcript.scrollHeight;
+        }
+
+        // Handle collapsible elements
+        const collapsibleElements = document.querySelectorAll('.collapsible');
+        collapsibleElements.forEach(element => {
+            element.addEventListener('click', function() {
+                this.classList.toggle('active');
+                const content = this.nextElementSibling;
+                if (content.style.display === 'block') {
+                    content.style.display = 'none';
+                } else {
+                    content.style.display = 'block';
+                }
+            });
+        });
+
+        // Add a function to check session status
+        async function checkSessionStatus() {
+            try {
+                const supabaseClient = await ensureSupabaseInitialized();
+                const { data: { session }, error } = await supabaseClient.auth.getSession();
+                console.log('Current session status:', {
+                    hasSession: !!session,
+                    hasError: !!error,
+                    errorMessage: error?.message,
+                    userEmail: session?.user?.email,
+                    userId: session?.user?.id
+                });
+                return { session, error };
+            } catch (error) {
+                console.error('Error checking session status:', error);
+                return { session: null, error };
+            }
+        }
+
+        // Call checkSessionStatus on page load
+        document.addEventListener('DOMContentLoaded', async () => {
+            console.log('Checking initial session status...');
+            await checkSessionStatus();
+        });
+
+        // Add a function to get session with timeout
+        async function getSessionWithTimeout(timeoutMs = 5000) {
+            return new Promise((resolve, reject) => {
+                const timeoutId = setTimeout(() => {
+                    reject(new Error('Session retrieval timed out'));
+                }, timeoutMs);
+
+                supabase.auth.getSession()
+                    .then(response => {
+                        clearTimeout(timeoutId);
+                        resolve(response);
+                    })
+                    .catch(error => {
+                        clearTimeout(timeoutId);
+                        reject(error);
+                    });
+            });
+        }
+
+        async function saveTranscript() {
+            try {
+                console.log('Starting transcript save process...');
+                console.log('Current session state:', {
+                    exists: !!currentSession,
+                    user: currentSession?.user,
+                    accessToken: currentSession?.access_token
+                });
+
+                if (!currentSession?.access_token) {
+                    throw new Error('No valid session found');
+                }
+
+                // Format the transcript content
+                const transcriptText = fullTranscript
+                    .map(line => `${line.displayName}: ${line.text}`)
+                    .join('\n');
+
+                const requestBody = {
+                    id: currentSession.user.id,  // This should match auth.uid()
+                    title: `Meeting ${new Date().toLocaleString()}`,
+                    content: transcriptText,
+                    duration: Math.round((new Date() - meetingStartTime) / 1000),
+                    speaker_count: new Set(fullTranscript.map(t => t.speakerId)).size
+                };
+
+                console.log('Sending transcript save request with body:', {
+                    id: requestBody.id,
+                    title: requestBody.title,
+                    contentLength: requestBody.content.length,
+                    duration: requestBody.duration,
+                    speakerCount: requestBody.speaker_count,
+                    hasAccessToken: !!currentSession.access_token
+                });
+
+                // Log the first few lines of content for debugging
+                console.log('First few lines of content:', requestBody.content.split('\n').slice(0, 3));
+
+                const response = await fetch('/api/transcripts', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${currentSession.access_token}`
+                    },
+                    body: JSON.stringify(requestBody)
+                });
+
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    console.error('Server error response:', errorData);
+                    throw new Error(errorData.error || 'Failed to save transcript');
+                }
+
+                const data = await response.json();
+                console.log('Transcript saved successfully:', data);
+                return data;
+            } catch (error) {
+                console.error('Error saving transcript:', error);
+                throw error;
+            }
+        }
+    </script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: 'Inter', sans-serif;
+        }
+
+        body {
+            background-color: #f5f7fb;
+            color: #1a1a1a;
+            line-height: 1.6;
+            display: flex;
+            min-height: 100vh;
+        }
+
+        /* Side Menu Styles */
+        .side-menu {
+            width: 300px;
+            background-color: white;
+            border-right: 1px solid #e0e0e0;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            position: fixed;
+            left: 0;
+            top: 0;
+        }
+
+        .side-menu-header {
+            padding: 2rem;
+            border-bottom: 1px solid #e0e0e0;
+        }
+
+        .side-menu-content {
+            flex: 1;
+            overflow-y: auto;
+            padding: 1rem;
+        }
+
+        .side-menu-footer {
+            padding: 1rem;
+            border-top: 1px solid #e0e0e0;
+        }
+
+        .profile-section {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            padding: 0.5rem;
+            border-radius: 8px;
+            transition: background-color 0.2s;
+            cursor: pointer;
+            position: relative;
+            z-index: 999;
+        }
+
+        .profile-section:hover {
+            background-color: #f5f7fb;
+        }
+
+        .profile-avatar {
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            background-color: #2196F3;
+            color: white;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.2rem;
+        }
+
+        .profile-info {
+            flex: 1;
+        }
+
+        .profile-name {
+            font-weight: 500;
+            color: #1a1a1a;
+        }
+
+        .profile-email {
+            font-size: 0.875rem;
+            color: #666;
+        }
+
+        /* Usage Bar Styles */
+        .usage-section {
+            padding: 1rem;
+            border-top: 1px solid #e0e0e0;
+        }
+
+        .usage-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 0.5rem;
+        }
+
+        .usage-title {
+            font-size: 0.875rem;
+            color: #666;
+        }
+
+        .usage-amount {
+            font-size: 0.875rem;
+            font-weight: 500;
+            color: #1a1a1a;
+        }
+
+        .usage-bar {
+            width: 100%;
+            height: 6px;
+            background-color: #e0e0e0;
+            border-radius: 3px;
+            overflow: hidden;
+        }
+
+        .usage-progress {
+            height: 100%;
+            background-color: #2196F3;
+            border-radius: 3px;
+            transition: width 0.3s ease;
+        }
+
+        .usage-warning {
+            background-color: #ff9800;
+        }
+
+        .usage-critical {
+            background-color: #f44336;
+        }
+
+        /* Main Content Styles */
+        .main-content {
+            flex: 1;
+            margin-left: 300px;
+            padding: 2rem;
+            max-width: calc(100% - 300px);
+        }
+
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+            padding: 2rem;
+        }
+
+        header {
+            margin-bottom: 3rem;
+            text-align: center;
+        }
+
+        h1 {
+            font-size: 2.5rem;
+            font-weight: 600;
+            color: #1a1a1a;
+            margin-bottom: 1rem;
+        }
+
+        .upload-box {
+            background-color: white;
+            padding: 2rem;
+            border-radius: 12px;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+            margin-bottom: 2rem;
+        }
+
+        .file-input {
+            margin-bottom: 1.5rem;
+        }
+
+        input[type="file"] {
+            width: 100%;
+            padding: 0.75rem;
+            border: 2px dashed #e0e0e0;
+            border-radius: 8px;
+            background-color: #fafafa;
+            cursor: pointer;
+            transition: border-color 0.3s ease;
+        }
+
+        input[type="file"]:hover {
+            border-color: #2196F3;
+        }
+
+        button {
+            background-color: #2196F3;
+            color: white;
+            padding: 0.75rem 1.5rem;
+            border: none;
+            border-radius: 8px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: background-color 0.3s ease;
+        }
+
+        button:hover {
+            background-color: #1976D2;
+        }
+
+        #status {
+            margin: 1rem 0;
+            padding: 0.75rem;
+            border-radius: 8px;
+            font-weight: 500;
+        }
+
+        .status-processing {
+            background-color: #fff8e1;
+            color: #f57f17;
+        }
+
+        .status-complete {
+            background-color: #e8f5e9;
+            color: #2e7d32;
+        }
+
+        .status-error {
+            background-color: #ffebee;
+            color: #c62828;
+        }
+
+        .summary-section {
+            background-color: white;
+            padding: 2rem;
+            border-radius: 12px;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+            margin-bottom: 1.5rem;
+        }
+
+        .summary-section h2 {
+            color: #1a1a1a;
+            font-size: 1.5rem;
+            margin-bottom: 1rem;
+            font-weight: 600;
+        }
+
+        .transcript-section {
+            background-color: white;
+            border-radius: 12px;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+            overflow: hidden;
+        }
+
+        .collapsible {
+            background-color: white;
+            color: #1a1a1a;
+            font-weight: 500;
+            padding: 1.5rem;
+            width: 100%;
+            text-align: left;
+            border-bottom: 1px solid #f0f0f0;
+        }
+
+        .collapsible:hover {
+            background-color: #fafafa;
+        }
+
+        .transcript-content {
+            padding: 1.5rem;
+            background-color: white;
+        }
+
+        .speaker-name {
+            color: #2196F3;
+            font-weight: 500;
+            cursor: pointer;
+            padding: 0.25rem 0.5rem;
+            border-radius: 4px;
+            transition: background-color 0.3s ease;
+        }
+
+        .speaker-name:hover {
+            background-color: #e3f2fd;
+        }
+
+        .speaker-name-edit {
+            font-family: inherit;
+            font-size: inherit;
+            font-weight: 500;
+            color: #2196F3;
+            border: 2px solid #2196F3;
+            border-radius: 4px;
+            padding: 0.25rem 0.5rem;
+            margin: 0;
+            width: auto;
+            min-width: 120px;
+        }
+
+        .speaker-name-edit:focus {
+            outline: none;
+            box-shadow: 0 0 0 3px rgba(33, 150, 243, 0.2);
+        }
+
+        #summary {
+            line-height: 1.8;
+        }
+
+        #transcript {
+            max-height: 400px;
+            overflow-y: auto;
+            padding: 1rem;
+            background-color: white;
+            border-radius: 8px;
+            box-shadow: inset 0 0 5px rgba(0,0,0,0.1);
+            display: flex;
+            flex-direction: column;
+        }
+
+        .transcript-container {
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+            flex-grow: 1;
+        }
+
+        .transcript-line {
+            display: flex;
+            gap: 0.5rem;
+            align-items: baseline;
+            animation: fadeIn 0.3s ease-in-out;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(-10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        #transcript div {
+            margin-bottom: 0.5rem;
+            line-height: 1.5;
+        }
+
+        #transcript .interim {
+            color: #666;
+            font-style: italic;
+        }
+
+        #transcript strong {
+            color: #2196F3;
+            font-weight: 500;
+        }
+
+        @media (max-width: 768px) {
+            .container {
+                padding: 1rem;
+            }
+
+            h1 {
+                font-size: 2rem;
+            }
+
+            .upload-box, .summary-section, .transcript-section {
+                padding: 1.5rem;
+            }
+        }
+
+        .record-box {
+            background-color: white;
+            padding: 2rem;
+            border-radius: 12px;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+            margin-bottom: 2rem;
+        }
+
+        .record-controls {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        .record-button {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            background-color: #dc3545;
+        }
+
+        .record-button:hover {
+            background-color: #c82333;
+        }
+
+        .recording-status {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-weight: 500;
+        }
+
+        .recording-indicator {
+            display: none;
+            width: 12px;
+            height: 12px;
+            background-color: #dc3545;
+            border-radius: 50%;
+            animation: pulse 1.5s infinite;
+        }
+
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.4; }
+            100% { opacity: 1; }
+        }
+
+        .record-box h2 {
+            margin-bottom: 1.5rem;
+            color: #1a1a1a;
+            font-size: 1.5rem;
+            font-weight: 600;
+        }
+
+        .interim {
+            color: #666;
+            font-style: italic;
+            margin-top: 0.5rem;
+        }
+
+        .qa-section {
+            background-color: white;
+            padding: 2rem;
+            border-radius: 12px;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+            margin-bottom: 2rem;
+        }
+
+        .qa-section h2 {
+            color: #1a1a1a;
+            font-size: 1.5rem;
+            margin-bottom: 1rem;
+            font-weight: 600;
+        }
+
+        .question-input {
+            display: flex;
+            gap: 1rem;
+            margin-bottom: 1rem;
+        }
+
+        .question-input input {
+            flex-grow: 1;
+            padding: 0.75rem;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 1rem;
+        }
+
+        .question-input input:focus {
+            border-color: #2196F3;
+            outline: none;
+            box-shadow: 0 0 0 3px rgba(33, 150, 243, 0.1);
+        }
+
+        .answer-box {
+            background-color: #f8f9fa;
+            border-radius: 8px;
+            padding: 1rem;
+            margin-top: 1rem;
+            display: none;
+        }
+
+        .answer-box.active {
+            display: block;
+            animation: fadeIn 0.3s ease-in-out;
+        }
+
+        /* Add styles for past transcripts section */
+        .past-transcripts-section {
+            background-color: white;
+            padding: 2rem;
+            border-radius: 12px;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+            margin-bottom: 2rem;
+        }
+
+        .past-transcripts-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1.5rem;
+        }
+
+        .search-bar {
+            display: flex;
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .search-input {
+            flex: 1;
+            padding: 0.75rem;
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 1rem;
+        }
+
+        .filter-dropdown {
+            padding: 0.75rem;
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+            background-color: white;
+            font-size: 1rem;
+        }
+
+        .transcripts-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 1.5rem;
+        }
+
+        .transcript-card {
+            background-color: #f8f9fa;
+            border-radius: 8px;
+            padding: 1.5rem;
+            cursor: pointer;
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }
+
+        .transcript-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+
+        .transcript-card h3 {
+            margin-bottom: 0.5rem;
+            color: #1a1a1a;
+        }
+
+        .transcript-meta {
+            font-size: 0.875rem;
+            color: #666;
+            margin-bottom: 1rem;
+        }
+
+        .transcript-preview {
+            font-size: 0.875rem;
+            color: #444;
+            display: -webkit-box;
+            -webkit-line-clamp: 3;
+            line-clamp: 3;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+        }
+
+        .action-buttons {
+            display: flex;
+            gap: 0.5rem;
+            margin-top: 1rem;
+        }
+
+        .action-button {
+            padding: 0.5rem 1rem;
+            border-radius: 6px;
+            font-size: 0.875rem;
+            cursor: pointer;
+            transition: background-color 0.2s ease;
+        }
+
+        .action-button.primary {
+            background-color: #2196F3;
+            color: white;
+        }
+
+        .action-button.secondary {
+            background-color: #e0e0e0;
+            color: #333;
+        }
+
+        /* Main Content Views */
+        .content-view {
+            display: none;
+        }
+
+        .content-view.active {
+            display: block;
+        }
+
+        .nav-item {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            padding: 1rem 1.5rem;
+            color: #666;
+            text-decoration: none;
+            transition: all 0.2s ease;
+            cursor: pointer;
+        }
+
+        .nav-item:hover {
+            background-color: #f5f7fb;
+            color: #2196F3;
+        }
+
+        .nav-item.active {
+            color: #2196F3;
+            background-color: #e3f2fd;
+            font-weight: 500;
+        }
+
+        .nav-item i {
+            font-size: 1.2rem;
+            width: 24px;
+            text-align: center;
+        }
+
+        /* Calendar Styles */
+        .calendar-container {
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+            padding: 2rem;
+        }
+
+        .calendar-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 2rem;
+        }
+
+        .calendar-nav {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        .calendar-nav button {
+            background: none;
+            border: none;
+            color: #666;
+            cursor: pointer;
+            padding: 0.5rem;
+            border-radius: 50%;
+            transition: all 0.2s ease;
+        }
+
+        .calendar-nav button:hover {
+            background: #f5f7fb;
+            color: #2196F3;
+        }
+
+        .calendar-grid {
+            display: grid;
+            grid-template-columns: repeat(7, 1fr);
+            gap: 0.5rem;
+        }
+
+        .calendar-weekday {
+            text-align: center;
+            font-weight: 500;
+            color: #666;
+            padding: 0.5rem;
+        }
+
+        .calendar-day {
+            aspect-ratio: 1;
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+            padding: 0.5rem;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .calendar-day:hover {
+            background: #f5f7fb;
+            border-color: #2196F3;
+        }
+
+        .calendar-day.today {
+            background: #e3f2fd;
+            border-color: #2196F3;
+            font-weight: 500;
+        }
+
+        .calendar-day.has-meeting {
+            position: relative;
+        }
+
+        .calendar-day.has-meeting::after {
+            content: '';
+            position: absolute;
+            bottom: 0.25rem;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 4px;
+            height: 4px;
+            border-radius: 50%;
+            background: #2196F3;
+        }
+
+        .meeting-list {
+            margin-top: 2rem;
+        }
+
+        .meeting-card {
+            background: white;
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+            padding: 1rem;
+            margin-bottom: 1rem;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .meeting-card:hover {
+            border-color: #2196F3;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+        }
+
+        .meeting-time {
+            font-size: 0.875rem;
+            color: #666;
+            margin-bottom: 0.5rem;
+        }
+
+        .meeting-title {
+            font-weight: 500;
+            margin-bottom: 0.5rem;
+        }
+
+        .meeting-participants {
+            font-size: 0.875rem;
+            color: #666;
+        }
+
+        .calendar-view-selector {
+            display: flex;
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+
+        .calendar-view-selector button {
+            background: none;
+            border: 1px solid #e0e0e0;
+            color: #666;
+            padding: 0.5rem 1rem;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .calendar-view-selector button.active {
+            background: #2196F3;
+            border-color: #2196F3;
+            color: white;
+        }
+
+        /* Auth UI Styles */
+        .auth-container {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.5);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 1000;
+        }
+
+        .auth-box {
+            background: white;
+            padding: 2rem;
+            border-radius: 12px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            width: 100%;
+            max-width: 400px;
+        }
+
+        .auth-box h2 {
+            margin-bottom: 1.5rem;
+            color: #1a1a1a;
+            font-size: 1.5rem;
+            font-weight: 600;
+        }
+
+        .auth-form {
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+        }
+
+        .auth-form input {
+            padding: 0.75rem;
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 1rem;
+            transition: border-color 0.3s ease;
+        }
+
+        .auth-form input:focus {
+            border-color: #2196F3;
+            outline: none;
+        }
+
+        .auth-form button {
+            background: #2196F3;
+            color: white;
+            padding: 0.75rem;
+            border: none;
+            border-radius: 8px;
+            font-size: 1rem;
+            cursor: pointer;
+            transition: background-color 0.3s ease;
+        }
+
+        .auth-form button:hover {
+            background: #1976D2;
+        }
+
+        .auth-toggle {
+            margin-top: 1rem;
+            text-align: center;
+            color: #666;
+        }
+
+        .auth-toggle button {
+            background: none;
+            border: none;
+            color: #2196F3;
+            cursor: pointer;
+            padding: 0;
+            font-size: inherit;
+        }
+
+        .auth-toggle button:hover {
+            text-decoration: underline;
+        }
+
+        .error-message {
+            color: #f44336;
+            margin-top: 0.5rem;
+            font-size: 0.875rem;
+        }
+
+        .settings-menu {
+            position: relative;
+            cursor: pointer;
+            z-index: 1000;
+        }
+
+        .settings-dropdown {
+            display: none;
+            position: absolute;
+            right: 0;
+            top: 100%;
+            background-color: white;
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            z-index: 1001;
+            min-width: 150px;
+            margin-top: 0.5rem;
+        }
+
+        .settings-dropdown.show {
+            display: block;
+        }
+
+        .dropdown-item {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.75rem 1rem;
+            width: 100%;
+            border: none;
+            background: none;
+            color: #1a1a1a;
+            cursor: pointer;
+            text-align: left;
+            font-size: 0.875rem;
+            transition: background-color 0.2s ease;
+        }
+
+        .dropdown-item:hover {
+            background-color: #f5f7fb;
+        }
+
+        .dropdown-item i {
+            width: 16px;
+            color: #666;
+        }
+    </style>
+</head>
+<body>
+    <!-- Auth container - visible by default -->
+    <div id="authContainer" class="auth-container">
+        <div class="auth-box">
+            <h2 id="authTitle">Sign In</h2>
+            <form id="authForm" class="auth-form">
+                <input type="email" id="authEmail" placeholder="Email" required>
+                <input type="password" id="authPassword" placeholder="Password" required>
+                <button type="submit" id="authSubmit">Sign In</button>
+                <div id="authError" class="error-message" style="display: none;"></div>
+            </form>
+            <div class="auth-toggle">
+                <span id="authToggleText">Don't have an account?</span>
+                <button type="button" id="authToggleBtn">Sign Up</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Main content - hidden by default -->
+    <div id="mainContent" style="display: none;">
+        <aside class="side-menu">
+            <div class="side-menu-header">
+                <h1 style="font-size: 1.5rem;">Speech Recognition</h1>
+            </div>
+            <div class="side-menu-content">
+                <div class="nav-item active" data-view="main">
+                    <i class="fas fa-microphone"></i>
+                    <span>Recording</span>
+                </div>
+                <div class="nav-item" data-view="transcripts">
+                    <i class="fas fa-history"></i>
+                    <span>Past Transcripts</span>
+                </div>
+                <div class="nav-item" data-view="calendar">
+                    <i class="fas fa-calendar"></i>
+                    <span>Calendar</span>
+                </div>
+            </div>
+            <div class="side-menu-footer">
+                <div class="profile-section">
+                    <div class="profile-avatar">
+                        <i class="fas fa-user"></i>
+                    </div>
+                    <div class="profile-info">
+                        <div class="profile-name" id="profileName">Loading...</div>
+                        <div class="profile-email" id="profileEmail">Loading...</div>
+                    </div>
+                    <div class="settings-menu">
+                        <i class="fas fa-cog" id="settingsCog"></i>
+                        <div class="settings-dropdown">
+                            <button id="logoutBtn" class="dropdown-item">
+                                <i class="fas fa-sign-out-alt"></i> Logout
+                            </button>
+                        </div>
+                    </div>
+                </div>
+                <div class="usage-section">
+                    <div class="usage-header">
+                        <span class="usage-title">Monthly Usage</span>
+                        <span class="usage-amount">180/300 minutes</span>
+                    </div>
+                    <div class="usage-bar">
+                        <div class="usage-progress" style="width: 60%;"></div>
+                    </div>
+                </div>
+            </div>
+        </aside>
+
+        <main class="main-content">
+            <!-- Main Recording View -->
+            <div class="content-view active" id="main-view">
+                <div class="container">
+                    <header>
+                        <h1>Speech Recognition</h1>
+                    </header>
+                    
+                    <div class="upload-box">
+                        <h2>Upload Audio File</h2>
+                        <form id="uploadForm" action="/upload" method="post" enctype="multipart/form-data">
+                            <div class="file-input">
+                                <input type="file" name="audioFile" id="audioFile" accept=".wav" required>
+                            </div>
+                            <button type="submit">Process Audio</button>
+                        </form>
+                        <div id="status"></div>
+                    </div>
+
+                    <div class="record-box">
+                        <h2>Live Recording</h2>
+                        <div class="recording-controls">
+                            <button id="startRecord" class="action-button primary">
+                                <i class="fas fa-microphone"></i> Start Recording
+                            </button>
+                            <button id="stopRecord" class="action-button secondary" style="display: none;">
+                                <i class="fas fa-stop"></i> Stop Recording
+                            </button>
+                            <button id="saveTranscript" class="action-button primary" style="display: none;">
+                                <i class="fas fa-save"></i> Save Transcript
+                            </button>
+                        </div>
+                        <div id="recordingStatus" class="recording-status"></div>
+                    </div>
+                    
+                    <div id="transcriptSection" class="transcript-section" style="display: none;">
+                        <h2>Live Transcript</h2>
+                        <div id="transcript" class="transcript"></div>
+                    </div>
+
+                    <div id="qaSection" class="qa-section" style="display: none;">
+                        <h2>Ask Questions</h2>
+                        <div class="qa-container">
+                            <input type="text" id="questionInput" placeholder="Ask a question about the meeting...">
+                            <button id="askButton" class="action-button primary">Ask</button>
+                            <div id="answer" class="answer-box"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Past Transcripts View -->
+            <div class="content-view" id="transcripts-view">
+                <div class="container">
+                    <header>
+                        <h1>Past Transcripts</h1>
+                    </header>
+                    
+                    <div class="past-transcripts-section">
+                        <div class="past-transcripts-header">
+                            <div class="search-bar" style="flex: 1; margin-bottom: 0;">
+                                <input type="text" class="search-input" placeholder="Search transcripts...">
+                                <select class="filter-dropdown">
+                                    <option value="all">All Time</option>
+                                    <option value="today">Today</option>
+                                    <option value="week">This Week</option>
+                                    <option value="month">This Month</option>
+                                </select>
+                            </div>
+                            <button class="action-button primary">Export All</button>
+                        </div>
+                        
+                        <div class="transcripts-grid" style="margin-top: 2rem;">
+                            <!-- Transcript cards will be dynamically populated here -->
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Add new Calendar View -->
+            <div class="content-view" id="calendar-view">
+                <div class="container">
+                    <header>
+                        <h1>Calendar</h1>
+                    </header>
+
+                    <div class="calendar-container">
+                        <div class="calendar-view-selector">
+                            <button class="active">Month</button>
+                            <button>Week</button>
+                            <button>Day</button>
+                            <button>List</button>
+                        </div>
+
+                        <div class="calendar-header">
+                            <div class="calendar-nav">
+                                <button><i class="fas fa-chevron-left"></i></button>
+                                <h2>February 2024</h2>
+                                <button><i class="fas fa-chevron-right"></i></button>
+                            </div>
+                            <button class="action-button primary">
+                                <i class="fas fa-plus"></i> New Meeting
+                            </button>
+                        </div>
+
+                        <div class="calendar-grid">
+                            <!-- Weekday headers -->
+                            <div class="calendar-weekday">Sun</div>
+                            <div class="calendar-weekday">Mon</div>
+                            <div class="calendar-weekday">Tue</div>
+                            <div class="calendar-weekday">Wed</div>
+                            <div class="calendar-weekday">Thu</div>
+                            <div class="calendar-weekday">Fri</div>
+                            <div class="calendar-weekday">Sat</div>
+
+                            <!-- Calendar days will be dynamically populated -->
+                        </div>
+
+                        <div class="meeting-list">
+                            <h3>Upcoming Meetings</h3>
+                            <div class="meeting-card">
+                                <div class="meeting-time">Today, 2:00 PM - 3:00 PM</div>
+                                <div class="meeting-title">Team Standup</div>
+                                <div class="meeting-participants">
+                                    <i class="fas fa-users"></i> 5 participants
+                                </div>
+                            </div>
+                            <div class="meeting-card">
+                                <div class="meeting-time">Tomorrow, 10:00 AM - 11:00 AM</div>
+                                <div class="meeting-title">Project Review</div>
+                                <div class="meeting-participants">
+                                    <i class="fas fa-users"></i> 8 participants
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        const form = document.getElementById('uploadForm');
+        const status = document.getElementById('status');
+        const summary = document.getElementById('summary');
+        const transcript = document.getElementById('transcript');
+    
+        function displayTranscript(transcriptText) {
+        const lines = transcriptText.split('\n');
+        
+        const processedLines = lines.map(line => {
+            return line.replace(/^(Speaker [^:]+|[^:]+):/, (match, speakerName) => {
+                return `<span class="speaker-name" onclick="makeEditable(this)">${speakerName}</span>:`;
+            });
+        });
+
+        transcript.innerHTML = processedLines.join('<br>');
+    }
+
+    
+        function displaySummary(summaryText) {
+            summary.textContent = summaryText;
+        }
+        // At the top of your script section, make these global
+        window.speakerNames = new Map(); // Make speakerNames global
+        // fullTranscript is already declared globally at the top
+
+        function extractName(text) {
+            // Common English words that shouldn't be treated as names
+            const commonWords = new Set([
+                'trying', 'testing', 'going', 'doing', 'making', 'taking', 'getting', 'seeing',
+                'working', 'looking', 'thinking', 'saying', 'using', 'finding', 'giving',
+                'this', 'that', 'here', 'there', 'what', 'where', 'when', 'why', 'how',
+                'the', 'and', 'but', 'for', 'not', 'with', 'app', 'test', 'work', 'see',
+                'recording', 'speaking', 'talking', 'calling', 'meeting', 'starting', 'stopping'
+            ]);
+
+            // More specific patterns for name introduction
+            const patterns = [
+                {
+                    regex: /my name is (\w+)/i,
+                    confidence: 1.0
+                },
+                {
+                    regex: /i am (\w+)/i,
+                    confidence: 0.8
+                },
+                {
+                    regex: /i'm (\w+)/i,
+                    confidence: 0.8
+                },
+                {
+                    regex: /this is (\w+)/i,
+                    confidence: 0.9
+                },
+                {
+                    regex: /(?:hi|hello),? (?:i am|i'm) (\w+)/i,
+                    confidence: 0.9
+                }
+            ];
+            
+            let bestMatch = null;
+            let highestConfidence = 0;
+
+            for (const pattern of patterns) {
+                const match = text.match(pattern.regex);
+                if (match) {
+                    const potentialName = match[1];
+                    
+                    // Skip if the potential name is a common word
+                    if (commonWords.has(potentialName.toLowerCase())) {
+                        continue;
+                    }
+                    
+                    // Basic name validation
+                    if (
+                        // Check if it starts with a capital letter
+                        potentialName[0] === potentialName[0].toUpperCase() &&
+                        // Check if rest is lowercase (typical for names)
+                        potentialName.slice(1).toLowerCase() === potentialName.slice(1) &&
+                        // Check minimum length
+                        potentialName.length >= 2 &&
+                        // Check if it's not just numbers
+                        !/^\d+$/.test(potentialName)
+                    ) {
+                        if (pattern.confidence > highestConfidence) {
+                            bestMatch = potentialName;
+                            highestConfidence = pattern.confidence;
+                        }
+                    }
+                }
+            }
+
+            // Only return the name if we're confident enough
+            return highestConfidence >= 0.8 ? bestMatch : null;
+        }
+
+        // Update the makeEditable function
+        window.makeEditable = function(element) {
+            const currentName = element.textContent.trim();
+            const speakerId = element.dataset.speakerId;
+            
+            const input = document.createElement('input');
+            input.type = 'text';
+            input.value = currentName;
+            input.className = 'speaker-name-edit';
+            input.dataset.speakerId = speakerId;
+            
+            // Replace span with input
+            element.parentNode.replaceChild(input, element);
+            input.focus();
+            input.select();
+
+            function saveEdit() {
+                const newName = input.value.trim();
+                if (!newName) {
+                    cancelEdit();
+                    return;
+                }
+
+                // Create new span element
+                const span = document.createElement('span');
+                span.className = 'speaker-name';
+                span.onclick = () => window.makeEditable(span);  // Use window.makeEditable
+                span.dataset.speakerId = speakerId;
+                span.textContent = newName;
+                
+                // Replace input with span
+                input.parentNode.replaceChild(span, input);
+
+                // Update all other instances
+                window.speakerNames.set(speakerId, newName);  // Use window.speakerNames
+                updateSpeakerName(speakerId, newName);
+            }
+
+            function cancelEdit() {
+                const span = document.createElement('span');
+                span.className = 'speaker-name';
+                span.onclick = () => window.makeEditable(span);  // Use window.makeEditable
+                span.dataset.speakerId = speakerId;
+                span.textContent = currentName;
+                input.parentNode.replaceChild(span, input);
+            }
+
+            input.addEventListener('blur', saveEdit);
+            input.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    saveEdit();
+                } else if (e.key === 'Escape') {
+                    e.preventDefault();
+                    cancelEdit();
+                }
+            });
+        };
+
+    function updateSpeakerName(speakerId, newName) {
+        // Update fullTranscript array
+        fullTranscript = fullTranscript.map(line => ({
+            ...line,
+            displayName: line.speakerId === speakerId ? newName : line.displayName
+        }));
+
+        // Update all matching speaker names in the DOM
+        const transcriptDiv = document.getElementById('transcript');
+        const speakerSpans = transcriptDiv.querySelectorAll(`.speaker-name[data-speaker-id="${speakerId}"]`);
+        speakerSpans.forEach(span => {
+            span.textContent = newName;
+        });
+    }
+
+    
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            status.textContent = 'Processing...';
+            summary.textContent = '';
+            transcript.textContent = '';
+    
+            const formData = new FormData(form);
+            try {
+                const response = await fetch('/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+                const result = await response.json();
+                
+                if (result.error) {
+                    throw new Error(result.error);
+                }
+    
+                status.textContent = 'Processing complete!';
+    
+                // Format and display transcript
+                const transcriptText = result.transcript
+                    .split('\n')
+                    .map(line => line.trim())
+                    .filter(line => line.length > 0)
+                    .join('\n');
+    
+                // Format and display summary
+                const summaryText = result.summary
+                    .split('\n')
+                    .map(line => line.trim())
+                    .filter(line => line.length > 0)
+                    .join('\n');
+    
+                // Show the sections
+                document.getElementById('summarySection').style.display = 'block';
+                document.getElementById('transcriptSection').style.display = 'block';
+    
+                // Update content using new display functions
+                displayTranscript(transcriptText);
+                displaySummary(summaryText);
+    
+            } catch (error) {
+                status.textContent = 'Error processing file';
+                console.error('Error:', error);
+                alert('Error processing file: ' + error.message);
+            }
+        });
+    </script>
+
+</body>
+</html>
