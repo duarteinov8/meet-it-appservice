@@ -79,6 +79,9 @@
         // Add a global variable to store the current session
         let currentSession = null;
 
+        // Add this after the supabase client initialization
+        let transcriptsSubscription = null;
+
         // Wait for DOM to be fully loaded
         document.addEventListener('DOMContentLoaded', () => {
             // Auth form handling
@@ -114,25 +117,59 @@
                     e.preventDefault();
                     e.stopPropagation();
                     try {
-                        console.log('Attempting to sign out...');
+                        console.log('Starting logout process...');
                         
-                        // Simple sign out
+                        // Close WebSocket connection if it exists
+                        if (ws) {
+                            console.log('Closing WebSocket connection...');
+                            ws.close();
+                            ws = null;
+                        }
+
+                        // Unsubscribe from real-time updates if active
+                        if (transcriptsSubscription) {
+                            console.log('Unsubscribing from real-time updates...');
+                            transcriptsSubscription.unsubscribe();
+                            transcriptsSubscription = null;
+                        }
+
+                        // Clear any active recordings
+                        fullTranscript = [];
+                        meetingStartTime = null;
+                        
+                        // Clear session data
+                        currentUser = null;
+                        currentSession = null;
+                        
+                        // Sign out from Supabase
+                        console.log('Signing out from Supabase...');
                         const { error } = await supabase.auth.signOut();
                         if (error) throw error;
                         
                         console.log('Successfully signed out');
                         
-                        // Clear UI state
-                        currentUser = null;
-                        currentSession = null;
+                        // Update UI
                         document.getElementById('authContainer').style.display = 'flex';
                         document.getElementById('mainContent').style.display = 'none';
                         
-                        // Redirect to sign in page
-                        window.location.href = '/';
+                        // Clear any error messages
+                        const authError = document.getElementById('authError');
+                        if (authError) {
+                            authError.style.display = 'none';
+                            authError.textContent = '';
+                        }
+                        
+                        // Reset form if it exists
+                        const authForm = document.getElementById('authForm');
+                        if (authForm) {
+                            authForm.reset();
+                        }
+                        
+                        // Reload the page to ensure clean state
+                        window.location.reload();
                         
                     } catch (error) {
-                        console.error('Error signing out:', error);
+                        console.error('Error during logout:', error);
                         alert('Error signing out. Please try again.');
                     }
                 });
@@ -591,6 +628,7 @@
                 const { data: { session } } = await supabase.auth.getSession();
                 if (!session) return;
 
+                // First, load existing transcripts
                 const { data: transcripts, error } = await supabase
                     .from('transcripts')
                     .select('*')
@@ -598,37 +636,30 @@
 
                 if (error) throw error;
 
-                if (transcripts.length === 0) {
-                    container.innerHTML = `
-                        <div class="no-transcripts">
-                            <h2>No transcripts found</h2>
-                            <p>Your meeting transcripts will appear here</p>
-                        </div>
-                    `;
-                    return;
+                // Render the transcripts
+                renderTranscripts(transcripts || []);
+
+                // Set up real-time subscription
+                if (transcriptsSubscription) {
+                    transcriptsSubscription.unsubscribe();
                 }
 
-                container.innerHTML = transcripts.map(transcript => `
-                    <div class="transcript-card">
-                        <div class="transcript-card-content">
-                            <div class="transcript-card-top">
-                                <div class="transcript-date">${formatDate(transcript.created_at)}</div>
-                                <div class="transcript-duration">
-                                    <i class="fas fa-clock"></i>
-                                    ${formatDuration(transcript.duration)}
-                                </div>
-                            </div>
-                            <h3 class="transcript-title">${transcript.title}</h3>
-                            <p class="transcript-summary">${transcript.summary || 'No summary available'}</p>
-                        </div>
-                        <div class="transcript-card-actions">
-                            <button class="view-transcript-btn" onclick="viewTranscript('${transcript.id}')">
-                                <i class="fas fa-eye"></i>
-                                View Transcript
-                            </button>
-                        </div>
-                    </div>
-                `).join('');
+                transcriptsSubscription = supabase
+                    .channel('transcripts-changes')
+                    .on(
+                        'postgres_changes',
+                        {
+                            event: '*', // Listen for all events (INSERT, UPDATE, DELETE)
+                            schema: 'public',
+                            table: 'transcripts',
+                            filter: `user_id=eq.${session.user.id}` // Only listen for current user's transcripts
+                        },
+                        (payload) => {
+                            console.log('Real-time update received:', payload);
+                            handleTranscriptChange(payload);
+                        }
+                    )
+                    .subscribe();
 
             } catch (error) {
                 console.error('Error loading transcripts:', error);
@@ -640,6 +671,122 @@
                 `;
             }
         }
+
+        // Add new function to handle real-time updates
+        function handleTranscriptChange(payload) {
+            const container = document.getElementById('transcriptsContainer');
+            if (!container) return;
+
+            // Get current transcripts from the DOM
+            const currentTranscripts = Array.from(container.querySelectorAll('.transcript-card')).map(card => ({
+                id: card.dataset.transcriptId,
+                created_at: card.dataset.createdAt,
+                title: card.querySelector('.transcript-title').textContent,
+                summary: card.querySelector('.transcript-summary').textContent,
+                duration: parseInt(card.dataset.duration)
+            }));
+
+            let updatedTranscripts = [...currentTranscripts];
+
+            switch (payload.eventType) {
+                case 'INSERT':
+                    // Add new transcript at the beginning
+                    updatedTranscripts.unshift(payload.new);
+                    break;
+                case 'UPDATE':
+                    // Update existing transcript
+                    updatedTranscripts = updatedTranscripts.map(t => 
+                        t.id === payload.new.id ? payload.new : t
+                    );
+                    break;
+                case 'DELETE':
+                    // Remove deleted transcript
+                    updatedTranscripts = updatedTranscripts.filter(t => t.id !== payload.old.id);
+                    break;
+            }
+
+            // Re-render the transcripts
+            renderTranscripts(updatedTranscripts);
+
+            // Show a notification for new transcripts
+            if (payload.eventType === 'INSERT') {
+                showNotification('New transcript available!');
+            }
+        }
+
+        // Add function to render transcripts
+        function renderTranscripts(transcripts) {
+            const container = document.getElementById('transcriptsContainer');
+            if (!container) return;
+
+            if (transcripts.length === 0) {
+                container.innerHTML = `
+                    <div class="no-transcripts">
+                        <h2>No transcripts found</h2>
+                        <p>Your meeting transcripts will appear here</p>
+                    </div>
+                `;
+                return;
+            }
+
+            container.innerHTML = transcripts.map(transcript => `
+                <div class="transcript-card" 
+                     data-transcript-id="${transcript.id}"
+                     data-created-at="${transcript.created_at}"
+                     data-duration="${transcript.duration}">
+                    <div class="transcript-card-content">
+                        <div class="transcript-card-top">
+                            <div class="transcript-date">${formatDate(transcript.created_at)}</div>
+                            <div class="transcript-duration">
+                                <i class="fas fa-clock"></i>
+                                ${formatDuration(transcript.duration)}
+                            </div>
+                        </div>
+                        <h3 class="transcript-title">${transcript.title}</h3>
+                        <p class="transcript-summary">${transcript.summary || 'No summary available'}</p>
+                    </div>
+                    <div class="transcript-card-actions">
+                        <button class="view-transcript-btn" onclick="viewTranscript('${transcript.id}')">
+                            <i class="fas fa-eye"></i>
+                            View Transcript
+                        </button>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        // Add notification function
+        function showNotification(message) {
+            // Create notification element if it doesn't exist
+            let notification = document.getElementById('notification');
+            if (!notification) {
+                notification = document.createElement('div');
+                notification.id = 'notification';
+                notification.className = 'notification';
+                document.body.appendChild(notification);
+            }
+
+            // Set message and show notification
+            notification.textContent = message;
+            notification.classList.add('show');
+
+            // Hide notification after 3 seconds
+            setTimeout(() => {
+                notification.classList.remove('show');
+            }, 3000);
+        }
+
+        // Add cleanup when leaving the transcripts view
+        document.querySelector('[data-view="transcripts"]')?.addEventListener('click', () => {
+            loadPastTranscripts();
+        });
+
+        // Add cleanup when leaving the page
+        window.addEventListener('beforeunload', () => {
+            if (transcriptsSubscription) {
+                transcriptsSubscription.unsubscribe();
+            }
+        });
 
         // Meeting management
         function startMeeting() {
@@ -1976,6 +2123,43 @@
         .dropdown-item i {
             width: 16px;
             color: #666;
+        }
+
+        /* Notification styles */
+        .notification {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            background-color: #2196F3;
+            color: white;
+            padding: 1rem 2rem;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+            transform: translateY(100px);
+            opacity: 0;
+            transition: all 0.3s ease;
+            z-index: 1000;
+        }
+
+        .notification.show {
+            transform: translateY(0);
+            opacity: 1;
+        }
+
+        /* Animation for new transcript cards */
+        .transcript-card {
+            animation: slideIn 0.3s ease-out;
+        }
+
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateY(20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
         }
     </style>
 </head>
