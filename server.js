@@ -282,6 +282,18 @@ app.get('/', (req, res) => {
     });
 });
 
+// Add route for transcripts page
+app.get('/transcripts', authenticateUser, (req, res) => {
+    res.render('transcripts', {
+        process: {
+            env: {
+                SUPABASE_URL: process.env.SUPABASE_URL,
+                SUPABASE_ANON_KEY: process.env.SUPABASE_ANON_KEY
+            }
+        }
+    });
+});
+
 app.post('/generate-summary', async (req, res) => {
     try {
         console.log('Received transcript for summary:', req.body.transcript); // Add this

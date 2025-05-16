@@ -585,6 +585,8 @@
 
         // Load past transcripts from Supabase
         async function loadPastTranscripts() {
+            const container = document.getElementById('transcriptsContainer');
+            
             try {
                 const { data: { session } } = await supabase.auth.getSession();
                 if (!session) return;
@@ -596,18 +598,46 @@
 
                 if (error) throw error;
 
-                const transcriptsList = document.getElementById('transcriptsList');
-                if (transcriptsList) {
-                    transcriptsList.innerHTML = transcripts.map(transcript => `
-                        <div class="transcript-item">
-                            <h3>${transcript.title}</h3>
-                            <p>${transcript.content}</p>
-                            <small>${new Date(transcript.created_at).toLocaleString()}</small>
+                if (transcripts.length === 0) {
+                    container.innerHTML = `
+                        <div class="no-transcripts">
+                            <h2>No transcripts found</h2>
+                            <p>Your meeting transcripts will appear here</p>
                         </div>
-                    `).join('');
+                    `;
+                    return;
                 }
+
+                container.innerHTML = transcripts.map(transcript => `
+                    <div class="transcript-card">
+                        <div class="transcript-card-content">
+                            <div class="transcript-card-top">
+                                <div class="transcript-date">${formatDate(transcript.created_at)}</div>
+                                <div class="transcript-duration">
+                                    <i class="fas fa-clock"></i>
+                                    ${formatDuration(transcript.duration)}
+                                </div>
+                            </div>
+                            <h3 class="transcript-title">${transcript.title}</h3>
+                            <p class="transcript-summary">${transcript.summary || 'No summary available'}</p>
+                        </div>
+                        <div class="transcript-card-actions">
+                            <button class="view-transcript-btn" onclick="viewTranscript('${transcript.id}')">
+                                <i class="fas fa-eye"></i>
+                                View Transcript
+                            </button>
+                        </div>
+                    </div>
+                `).join('');
+
             } catch (error) {
                 console.error('Error loading transcripts:', error);
+                container.innerHTML = `
+                    <div class="error">
+                        <h2>Error loading transcripts</h2>
+                        <p>${error.message}</p>
+                    </div>
+                `;
             }
         }
 
@@ -906,6 +936,88 @@
                 console.error('Error saving transcript:', error);
                 throw error;
             }
+        }
+
+        // Format date to DD/MM/YYYY
+        function formatDate(dateString) {
+            const date = new Date(dateString);
+            return date.toLocaleDateString('en-GB', {
+                day: '2-digit',
+                month: '2-digit',
+                year: 'numeric'
+            });
+        }
+
+        // Format duration to HH:MM:SS
+        function formatDuration(seconds) {
+            const hours = Math.floor(seconds / 3600);
+            const minutes = Math.floor((seconds % 3600) / 60);
+            const remainingSeconds = seconds % 60;
+
+            return [hours, minutes, remainingSeconds]
+                .map(val => val.toString().padStart(2, '0'))
+                .join(':');
+        }
+
+        // Add search and filter functionality
+        document.getElementById('transcriptSearch')?.addEventListener('input', (e) => {
+            const searchTerm = e.target.value.toLowerCase();
+            const cards = document.querySelectorAll('.transcript-card');
+            
+            cards.forEach(card => {
+                const title = card.querySelector('.transcript-title').textContent.toLowerCase();
+                const summary = card.querySelector('.transcript-summary').textContent.toLowerCase();
+                const date = card.querySelector('.transcript-date').textContent.toLowerCase();
+                
+                const matches = title.includes(searchTerm) || 
+                               summary.includes(searchTerm) || 
+                               date.includes(searchTerm);
+                
+                card.style.display = matches ? 'block' : 'none';
+            });
+        });
+
+        document.getElementById('transcriptFilter')?.addEventListener('change', (e) => {
+            const filter = e.target.value;
+            const cards = document.querySelectorAll('.transcript-card');
+            const now = new Date();
+            
+            cards.forEach(card => {
+                const date = new Date(card.querySelector('.transcript-date').textContent);
+                let show = true;
+                
+                switch (filter) {
+                    case 'today':
+                        show = date.toDateString() === now.toDateString();
+                        break;
+                    case 'week':
+                        const weekAgo = new Date(now.setDate(now.getDate() - 7));
+                        show = date >= weekAgo;
+                        break;
+                    case 'month':
+                        const monthAgo = new Date(now.setMonth(now.getMonth() - 1));
+                        show = date >= monthAgo;
+                        break;
+                }
+                
+                card.style.display = show ? 'block' : 'none';
+            });
+        });
+
+        // Update navigation to load transcripts when clicking the transcripts tab
+        document.querySelector('[data-view="transcripts"]')?.addEventListener('click', () => {
+            loadPastTranscripts();
+        });
+
+        // Add the viewTranscript function
+        function viewTranscript(transcriptId) {
+            // Prevent the card click event from firing
+            event.stopPropagation();
+            
+            // TODO: Implement transcript viewing functionality
+            console.log('Viewing transcript:', transcriptId);
+            // You can implement the actual viewing logic here
+            // For example, opening a modal or navigating to a detailed view
         }
     </script>
     <style>
@@ -1419,11 +1531,48 @@
         }
 
         .transcript-card {
-            background-color: #f8f9fa;
-            border-radius: 8px;
+            background-color: white;
+            border-radius: 12px;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
             padding: 1.5rem;
-            cursor: pointer;
             transition: transform 0.2s ease, box-shadow 0.2s ease;
+            cursor: pointer;
+            position: relative;
+        }
+
+        .transcript-card-content {
+            margin-bottom: 1rem;
+        }
+
+        .transcript-card-actions {
+            display: flex;
+            justify-content: flex-end;
+            margin-top: 1rem;
+            padding-top: 1rem;
+            border-top: 1px solid #e0e0e0;
+        }
+
+        .view-transcript-btn {
+            background-color: #2196F3;
+            color: white;
+            padding: 0.5rem 1rem;
+            border: none;
+            border-radius: 6px;
+            font-size: 0.875rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: background-color 0.2s ease;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .view-transcript-btn:hover {
+            background-color: #1976D2;
+        }
+
+        .view-transcript-btn i {
+            font-size: 0.875rem;
         }
 
         .transcript-card:hover {
@@ -1431,49 +1580,81 @@
             box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
         }
 
-        .transcript-card h3 {
+        .transcript-card-top {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
             margin-bottom: 0.5rem;
-            color: #1a1a1a;
         }
 
-        .transcript-meta {
+        .transcript-date {
             font-size: 0.875rem;
-            color: #666;
+            color: #2196F3;
+            font-weight: 500;
+        }
+
+        .transcript-duration {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 0.875rem;
+            color: #2196F3;
+            font-weight: 500;
+        }
+
+        .transcript-duration i {
+            font-size: 1rem;
+            color: #2196F3;
+        }
+
+        .transcript-title {
+            font-size: 1.25rem;
+            font-weight: 600;
+            color: #1a1a1a;
             margin-bottom: 1rem;
         }
 
-        .transcript-preview {
-            font-size: 0.875rem;
-            color: #444;
+        .transcript-summary {
+            color: #4a4a4a;
+            margin-bottom: 1rem;
             display: -webkit-box;
             -webkit-line-clamp: 3;
-            line-clamp: 3;
             -webkit-box-orient: vertical;
             overflow: hidden;
         }
 
-        .action-buttons {
+        .transcript-meta {
             display: flex;
-            gap: 0.5rem;
-            margin-top: 1rem;
-        }
-
-        .action-button {
-            padding: 0.5rem 1rem;
-            border-radius: 6px;
+            justify-content: space-between;
+            align-items: center;
             font-size: 0.875rem;
-            cursor: pointer;
-            transition: background-color 0.2s ease;
+            color: #666;
         }
 
-        .action-button.primary {
-            background-color: #2196F3;
-            color: white;
+        .no-transcripts {
+            grid-column: 1 / -1;
+            text-align: center;
+            padding: 3rem;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
         }
 
-        .action-button.secondary {
-            background-color: #e0e0e0;
-            color: #333;
+        .error {
+            grid-column: 1 / -1;
+            text-align: center;
+            padding: 2rem;
+            color: #dc3545;
+            background: #fff;
+            border-radius: 12px;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+        }
+
+        .loading {
+            grid-column: 1 / -1;
+            text-align: center;
+            padding: 2rem;
+            color: #666;
         }
 
         /* Main Content Views */
@@ -1619,8 +1800,9 @@
 
         .meeting-time {
             font-size: 0.875rem;
-            color: #666;
+            color: #2196F3;
             margin-bottom: 0.5rem;
+            font-weight: 500;
         }
 
         .meeting-title {
@@ -1630,7 +1812,11 @@
 
         .meeting-participants {
             font-size: 0.875rem;
-            color: #666;
+            color: #2196F3;
+        }
+
+        .meeting-participants i {
+            color: #2196F3;
         }
 
         .calendar-view-selector {
@@ -1915,26 +2101,22 @@
             <!-- Past Transcripts View -->
             <div class="content-view" id="transcripts-view">
                 <div class="container">
-                    <header>
-                        <h1>Past Transcripts</h1>
-                    </header>
-                    
                     <div class="past-transcripts-section">
                         <div class="past-transcripts-header">
-                            <div class="search-bar" style="flex: 1; margin-bottom: 0;">
-                                <input type="text" class="search-input" placeholder="Search transcripts...">
-                                <select class="filter-dropdown">
+                            <h2>Past Transcripts</h2>
+                            <div class="search-bar">
+                                <input type="text" class="search-input" placeholder="Search transcripts..." id="transcriptSearch">
+                                <select class="filter-dropdown" id="transcriptFilter">
                                     <option value="all">All Time</option>
                                     <option value="today">Today</option>
                                     <option value="week">This Week</option>
                                     <option value="month">This Month</option>
                                 </select>
                             </div>
-                            <button class="action-button primary">Export All</button>
                         </div>
                         
-                        <div class="transcripts-grid" style="margin-top: 2rem;">
-                            <!-- Transcript cards will be dynamically populated here -->
+                        <div id="transcriptsContainer" class="transcripts-grid">
+                            <div class="loading">Loading transcripts...</div>
                         </div>
                     </div>
                 </div>
