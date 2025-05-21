@@ -9,7 +9,7 @@ env:
   AZURE_WEBAPP_NAME: ${{ secrets.AZURE_WEBAPP_NAME }}
   AZURE_FUNCTIONAPP_NAME: ${{ secrets.AZURE_FUNCTIONAPP_NAME }}
   NODE_VERSION: '20.x'
-  PYTHON_VERSION: '3.8'
+  PYTHON_VERSION: '3.11'
 
 jobs:
   deploy-webapp:
@@ -42,6 +42,11 @@ jobs:
     steps:
     - uses: actions/checkout@v3
 
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
@@ -58,4 +63,6 @@ jobs:
       with:
         app-name: ${{ env.AZURE_FUNCTIONAPP_NAME }}
         package: azure-functions
-        publish-profile: ${{ secrets.AZURE_FUNCTIONAPP_PUBLISH_PROFILE }} 
+        auth-level: function
+        publish-profile: ${{ secrets.AZURE_FUNCTIONAPP_PUBLISH_PROFILE }}
+        creds: ${{ secrets.AZURE_CREDENTIALS }} 
