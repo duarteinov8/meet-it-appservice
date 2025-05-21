@@ -1,20 +1,19 @@
-name: Deploy to Azure App Service
+name: Deploy to Azure
 
 on:
   push:
-    branches: [ "main" ]  # or your default branch
-  workflow_dispatch:      # allows manual trigger
+    branches: [ main ]
+  workflow_dispatch:
 
 env:
-  AZURE_WEBAPP_NAME: meeting-transcription    # set this to your app's name
-  AZURE_WEBAPP_PACKAGE_PATH: '.'              # set this to the path to your web app project
-  NODE_VERSION: '20.x'                        # set this to the node version to use
-  PYTHON_VERSION: '3.8'                       # set this to the python version to use
+  AZURE_WEBAPP_NAME: ${{ secrets.AZURE_WEBAPP_NAME }}
+  AZURE_FUNCTIONAPP_NAME: ${{ secrets.AZURE_FUNCTIONAPP_NAME }}
+  NODE_VERSION: '20.x'
+  PYTHON_VERSION: '3.8'
 
 jobs:
-  build-and-deploy:
+  deploy-webapp:
     runs-on: ubuntu-latest
-    
     steps:
     - uses: actions/checkout@v3
 
@@ -22,30 +21,43 @@ jobs:
       uses: actions/setup-node@v3
       with:
         node-version: ${{ env.NODE_VERSION }}
-        cache: 'npm'
-
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: ${{ env.PYTHON_VERSION }}
-        cache: 'pip'
 
     - name: Install Node.js dependencies
-      run: npm ci
-
-    - name: Install Python dependencies
       run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
+        npm ci
+        npm run build
 
     - name: Create uploads and transcripts directories
       run: |
         mkdir -p uploads
         mkdir -p transcripts
 
-    - name: Deploy to Azure App Service
+    - name: Deploy to Azure Web App
       uses: azure/webapps-deploy@v2
       with:
         app-name: ${{ env.AZURE_WEBAPP_NAME }}
-        package: ${{ env.AZURE_WEBAPP_PACKAGE_PATH }}
-        publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }} 
+        publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
+        package: .
+
+  deploy-functions:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: Install Python dependencies for Functions
+      run: |
+        cd azure-functions
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Deploy to Azure Functions
+      uses: Azure/functions-action@v1
+      with:
+        app-name: ${{ env.AZURE_FUNCTIONAPP_NAME }}
+        package: azure-functions
+        publish-profile: ${{ secrets.AZURE_FUNCTIONAPP_PUBLISH_PROFILE }} 
