@@ -4,24 +4,46 @@ const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
 const OpenAI = require('openai');
-const { createClient } = require('@supabase/supabase-js');
-const { supabase: supabaseClient, saveTranscript, getTranscripts, createMeeting, getMeetings, verifyAuth } = require('./config/supabase');
+const { supabase, getAuthenticatedClient, verifyAuth, saveTranscript, getTranscripts, createMeeting, getMeetings } = require('./config/supabase');
 const app = express();
-const port = 3000;
+const port = process.env.PORT || 3000;
 require('dotenv').config();
 
-// Initialize Supabase client
-const supabase = createClient(
-    process.env.SUPABASE_URL,
-    process.env.SUPABASE_ANON_KEY,
-    {
-        auth: {
-            autoRefreshToken: true,
-            persistSession: true,
-            detectSessionInUrl: true
-        }
-    }
-);
+// Health check endpoint for Azure App Service
+app.get('/health', (req, res) => {
+    res.status(200).json({
+        status: 'healthy',
+        timestamp: new Date().toISOString(),
+        environment: process.env.NODE_ENV || 'development'
+    });
+});
+
+// Add production logging
+if (process.env.NODE_ENV === 'production') {
+    const winston = require('winston');
+    const logger = winston.createLogger({
+        level: 'info',
+        format: winston.format.json(),
+        defaultMeta: { service: 'meeting-transcription' },
+        transports: [
+            new winston.transports.Console({
+                format: winston.format.simple()
+            })
+        ]
+    });
+    
+    // Override console methods
+    console.log = (...args) => logger.info.call(logger, ...args);
+    console.error = (...args) => logger.error.call(logger, ...args);
+    console.warn = (...args) => logger.warn.call(logger, ...args);
+    console.info = (...args) => logger.info.call(logger, ...args);
+}
+
+// Debug: Check environment variables
+console.log('=== Environment Check ===');
+console.log('SUPABASE_URL:', process.env.SUPABASE_URL ? '✓ Set' : '✗ Missing');
+console.log('SUPABASE_ANON_KEY:', process.env.SUPABASE_ANON_KEY ? '✓ Set' : '✗ Missing');
+console.log('=======================');
 
 // Set EJS as the view engine
 app.set('view engine', 'ejs');
@@ -101,11 +123,12 @@ server.on('error', (error) => {
 });
 
 // Handle WebSocket connections
-wss.on('connection', (ws) => {
+wss.on('connection', async (ws) => {
     console.log('New WebSocket connection');
     let currentUser = null;
     let transcriptionBuffer = [];
     let meetingStartTime = new Date();
+    let isAuthenticated = false;
 
     // Function to format transcription data
     const formatTranscription = (transcriptions) => {
@@ -147,66 +170,125 @@ wss.on('connection', (ws) => {
         }
     };
 
-    const pythonProcess = spawn('python', ['enroll_speakers.py', '--live']);
-
-    pythonProcess.stdout.on('data', (data) => {
-        const output = data.toString();
-        console.log('Python output:', output);
-        
-        try {
-            // Check for transcription data
-            if (output.includes('TRANSCRIBED:') || output.includes('TRANSCRIBING:')) {
-                // Extract text and speaker ID using more robust regex
-                const textMatch = output.match(/Text=([^\n]+)/);
-                const speakerMatch = output.match(/Speaker ID=([^\n]+)/);
-                
-                if (textMatch && speakerMatch) {
-                    const transcription = {
-                        text: textMatch[1].trim(),
-                        speakerId: speakerMatch[1].trim(),
-                        type: output.includes('TRANSCRIBED:') ? 'final' : 'interim',
-                        timestamp: new Date()
-                    };
-                    
-                    if (ws.readyState === WebSocket.OPEN) {
-                        ws.send(JSON.stringify(transcription));
-                        console.log('Sent transcription:', transcription);
-
-                        // If it's a final transcription, add it to the buffer
-                        if (transcription.type === 'final') {
-                            transcriptionBuffer.push(transcription);
-                            
-                            // Save to Supabase every 10 final transcriptions
-                            if (transcriptionBuffer.length >= 10) {
-                                saveTranscriptionToSupabase(transcriptionBuffer);
-                                transcriptionBuffer = []; // Clear the buffer
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (error) {
-            console.error('Error processing transcription:', error);
-        }
-    });
-
-    pythonProcess.stderr.on('data', (data) => {
-        console.error('Python error:', data.toString());
-    });
-
     // Handle user authentication
     ws.on('message', async (message) => {
         try {
             const data = JSON.parse(message);
             
             if (data.type === 'auth') {
+                console.log('Received auth message');
+                
+                // Verify the token
                 const { data: { user }, error } = await supabase.auth.getUser(data.token);
-                if (error) throw error;
+                if (error) {
+                    console.error('Auth error:', error);
+                    ws.send(JSON.stringify({ type: 'auth_response', error: 'Invalid token' }));
+                    ws.close();
+                    return;
+                }
+
+                // If token is invalid, try to refresh it
+                if (error && error.message.includes('invalid token')) {
+                    console.log('Token invalid, attempting to refresh...');
+                    const { data: { session }, error: refreshError } = await supabase.auth.refreshSession();
+                    
+                    if (refreshError) {
+                        console.error('Error refreshing session:', refreshError);
+                        ws.send(JSON.stringify({ type: 'auth_response', error: 'Failed to refresh token' }));
+                        ws.close();
+                        return;
+                    }
+                    
+                    if (!session) {
+                        ws.send(JSON.stringify({ type: 'auth_response', error: 'No session after refresh' }));
+                        ws.close();
+                        return;
+                    }
+                    
+                    // Try to get user with new token
+                    const { data: { user: refreshedUser }, error: userError } = await supabase.auth.getUser(session.access_token);
+                    if (userError) {
+                        ws.send(JSON.stringify({ type: 'auth_response', error: 'Failed to get user after refresh' }));
+                        ws.close();
+                        return;
+                    }
+                    
+                    user = refreshedUser;
+                }
+
                 currentUser = user;
+                isAuthenticated = true;
                 console.log('User authenticated:', user.email);
+                
+                // Send success response
+                ws.send(JSON.stringify({ 
+                    type: 'auth_response',
+                    success: true,
+                    user: {
+                        id: user.id,
+                        email: user.email
+                    }
+                }));
+
+                // Start Python process after successful authentication
+                const pythonProcess = spawn('python', ['enroll_speakers.py', '--live']);
+
+                pythonProcess.stdout.on('data', (data) => {
+                    if (!isAuthenticated) return; // Don't process data if not authenticated
+                    
+                    const output = data.toString();
+                    console.log('Python output:', output);
+                    
+                    try {
+                        // Check for transcription data
+                        if (output.includes('TRANSCRIBED:') || output.includes('TRANSCRIBING:')) {
+                            // Extract text and speaker ID using more robust regex
+                            const textMatch = output.match(/Text=([^\n]+)/);
+                            const speakerMatch = output.match(/Speaker ID=([^\n]+)/);
+                            
+                            if (textMatch && speakerMatch) {
+                                const transcription = {
+                                    text: textMatch[1].trim(),
+                                    speakerId: speakerMatch[1].trim(),
+                                    type: output.includes('TRANSCRIBED:') ? 'final' : 'interim',
+                                    timestamp: new Date()
+                                };
+                                
+                                if (ws.readyState === WebSocket.OPEN) {
+                                    ws.send(JSON.stringify(transcription));
+                                    console.log('Sent transcription:', transcription);
+
+                                    // If it's a final transcription, add it to the buffer
+                                    if (transcription.type === 'final') {
+                                        transcriptionBuffer.push(transcription);
+                                        
+                                        // Save to Supabase every 10 final transcriptions
+                                        if (transcriptionBuffer.length >= 10) {
+                                            saveTranscriptionToSupabase(transcriptionBuffer);
+                                            transcriptionBuffer = []; // Clear the buffer
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } catch (error) {
+                        console.error('Error processing transcription:', error);
+                    }
+                });
+
+                pythonProcess.stderr.on('data', (data) => {
+                    console.error('Python error:', data.toString());
+                });
+
+                // Store the Python process in the WebSocket object for cleanup
+                ws.pythonProcess = pythonProcess;
             }
         } catch (error) {
             console.error('Error handling message:', error);
+            if (!isAuthenticated) {
+                ws.send(JSON.stringify({ type: 'auth_response', error: 'Invalid message format' }));
+                ws.close();
+            }
         }
     });
 
@@ -216,7 +298,10 @@ wss.on('connection', (ws) => {
         if (transcriptionBuffer.length > 0 && currentUser) {
             await saveTranscriptionToSupabase(transcriptionBuffer);
         }
-        pythonProcess.kill();
+        // Kill the Python process if it exists
+        if (ws.pythonProcess) {
+            ws.pythonProcess.kill();
+        }
     });
 });
 
@@ -224,18 +309,98 @@ app.use(express.json());  // Add this line for parsing JSON bodies
 
 // Add authentication middleware
 const authenticateUser = async (req, res, next) => {
-    const token = req.headers.authorization?.split(' ')[1];
-    if (!token) {
+    let token = req.headers.authorization;
+    console.log('Raw Authorization header:', token);
+    
+    // Handle both "Bearer token" and raw token formats
+    if (token) {
+        if (token.startsWith('Bearer ')) {
+            token = token.split(' ')[1];
+            console.log('Extracted token after Bearer:', token.substring(0, 20) + '...');
+        }
+    } else {
+        console.log('No Authorization header found');
         return res.status(401).json({ error: 'No token provided' });
     }
 
     try {
-        const { data: { user }, error } = await supabase.auth.getUser(token);
-        if (error) throw error;
+        // First try to get the user with the provided token
+        let { data: { user }, error } = await supabase.auth.getUser(token);
+        
+        // If token is invalid, try to refresh it
+        if (error && error.message.includes('invalid token')) {
+            console.log('Token invalid, attempting to refresh...');
+            const { data: { session }, error: refreshError } = await supabase.auth.refreshSession();
+            
+            if (refreshError) {
+                console.error('Error refreshing session:', refreshError);
+                throw refreshError;
+            }
+            
+            if (!session) {
+                throw new Error('No session after refresh');
+            }
+            
+            // Update the token and get user with new token
+            token = session.access_token;
+            const { data: { user: refreshedUser }, error: userError } = await supabase.auth.getUser(token);
+            
+            if (userError) {
+                throw userError;
+            }
+            
+            user = refreshedUser;
+        } else if (error) {
+            throw error;
+        }
+
+        console.log('Token verified successfully for user:', user.email);
+
+        // Use authenticated client to check user
+        const client = getAuthenticatedClient(token);
+        const { data: dbUser, error: dbError } = await client
+            .from('users')
+            .select('*')
+            .eq('id', user.id)
+            .single();
+
+        if (dbError && dbError.code !== 'PGRST116') { // PGRST116 is "not found" error
+            console.error('Error checking user in database:', dbError);
+            throw dbError;
+        }
+
+        if (!dbUser) {
+            console.log('User not found in database, creating record...');
+            // Create user record
+            const { data: newUser, error: createError } = await supabase
+                .from('users')
+                .insert([{
+                    id: user.id,
+                    email: user.email,
+                    name: user.email.split('@')[0],
+                    created_at: new Date().toISOString()
+                }])
+                .select()
+                .single();
+
+            if (createError) {
+                console.error('Error creating user record:', createError);
+                throw createError;
+            }
+            console.log('Created user record:', newUser);
+        }
+
+        // Store both the user and the token in the request
         req.user = user;
+        req.token = token;
         next();
     } catch (error) {
-        console.error('Authentication error:', error);
+        console.error('Authentication error details:', {
+            message: error.message,
+            code: error.code,
+            details: error.details,
+            hint: error.hint
+        });
         return res.status(401).json({ error: 'Invalid token' });
     }
 };
@@ -283,15 +448,53 @@ app.get('/', (req, res) => {
 });
 
 // Add route for transcripts page
-app.get('/transcripts', authenticateUser, (req, res) => {
-    res.render('transcripts', {
-        process: {
-            env: {
-                SUPABASE_URL: process.env.SUPABASE_URL,
-                SUPABASE_ANON_KEY: process.env.SUPABASE_ANON_KEY
-            }
+app.get('/transcripts', authenticateUser, async (req, res) => {
+    try {
+        // Use the token from the authenticateUser middleware
+        const token = req.token;
+        
+        // Get the current session using the token
+        const { data: { session }, error: sessionError } = await supabase.auth.getSession();
+        if (sessionError) {
+            console.error('Error getting session:', sessionError);
+            return res.redirect('/');
         }
-    });
+
+        if (!session) {
+            console.log('No active session, redirecting to login');
+            return res.redirect('/');
+        }
+
+        // Verify the session is still valid using the token
+        const { data: { user }, error: userError } = await supabase.auth.getUser(token);
+        if (userError) {
+            console.error('Error verifying user:', userError);
+            return res.redirect('/');
+        }
+
+        console.log('Rendering transcripts page with valid session:', {
+            userId: user.id,
+            email: user.email,
+            hasToken: !!token
+        });
+
+        res.render('transcripts', {
+            process: {
+                env: {
+                    SUPABASE_URL: process.env.SUPABASE_URL,
+                    SUPABASE_ANON_KEY: process.env.SUPABASE_ANON_KEY
+                }
+            },
+            initialSession: {
+                access_token: token,
+                refresh_token: session.refresh_token,
+                user: user
+            }
+        });
+    } catch (error) {
+        console.error('Error in /transcripts route:', error);
+        res.redirect('/');
+    }
 });
 
 app.post('/generate-summary', async (req, res) => {
@@ -376,20 +579,37 @@ app.post('/upload', authenticateUser, async (req, res) => {
     });
 });
 
-// Add endpoint to get user's transcripts
+// Update the transcripts endpoint to use authenticated client
 app.get('/api/transcripts', authenticateUser, async (req, res) => {
     try {
-        const { data: transcripts, error } = await getTranscripts(req.user.id);
-        if (error) throw error;
+        console.log('GET /api/transcripts - User:', {
+            id: req.user.id,
+            email: req.user.email,
+            role: req.user.role
+        });
+
+        // Get the raw token from the authorization header
+        const authHeader = req.headers.authorization;
+        console.log('Auth header:', authHeader ? 'present' : 'missing');
+
+        // Get transcripts
+        const transcripts = await getTranscripts(authHeader);
         
-        // Return the transcripts in the expected format
+        console.log('Transcripts fetched successfully:', {
+            count: transcripts?.length || 0,
+            userId: req.user.id,
+            firstTranscript: transcripts?.[0] ? {
+                id: transcripts[0].id,
+                transcript_id: transcripts[0].transcript_id,
+                title: transcripts[0].title
+            } : null
+        });
+
+        // Return the transcripts directly
         res.json(transcripts || []);
     } catch (error) {
-        console.error('Error fetching transcripts:', error);
-        res.status(500).json({ 
-            error: 'Error fetching transcripts',
-            details: error.message 
-        });
+        console.error('Error in /api/transcripts:', error);
+        res.status(500).json({ error: error.message });
     }
 });
 
@@ -451,143 +671,53 @@ app.post('/ask-question', async (req, res) => {
     }
 });
 
-// Add transcript saving endpoint
-app.post('/api/transcripts', async (req, res) => {
+// Update the transcript saving endpoint
+app.post('/api/transcripts', authenticateUser, async (req, res) => {
     try {
-        console.log('Received transcript save request');
-        console.log('Request headers:', req.headers);
-        console.log('Request body:', req.body);
-
-        const authHeader = req.headers.authorization;
-        if (!authHeader || !authHeader.startsWith('Bearer ')) {
-            console.log('No authorization header or invalid format');
-            return res.status(401).json({ error: 'Unauthorized - No token provided' });
-        }
-
-        const token = authHeader.split(' ')[1];
-        console.log('Verifying auth token...');
-        
-        // First verify the token with Supabase
-        const { data: { user: authUser }, error: authError } = await supabase.auth.getUser(token);
-        if (authError) {
-            console.error('Supabase auth error:', authError);
-            return res.status(401).json({ error: 'Unauthorized - Invalid token' });
-        }
-
-        console.log('Supabase auth user:', {
-            id: authUser.id,
-            email: authUser.email,
-            role: authUser.role
-        });
-
-        // Then verify with our custom function
-        const { user, error: verifyError } = await verifyAuth(token);
-        
-        if (verifyError) {
-            console.error('Custom auth verification error:', verifyError);
-            return res.status(401).json({ error: 'Unauthorized - Invalid token' });
-        }
-
-        if (!user) {
-            console.log('No user found for token');
-            return res.status(401).json({ error: 'Unauthorized - No user found' });
-        }
-
-        console.log('Custom auth user:', {
-            id: user.id,
-            email: user.email,
-            role: user.role
-        });
-
-        // Verify the user IDs match
-        if (authUser.id !== user.id) {
-            console.error('User ID mismatch:', {
-                supabaseId: authUser.id,
-                customId: user.id
-            });
-            return res.status(401).json({ error: 'Unauthorized - User ID mismatch' });
-        }
-
-        const { title, content, duration, speaker_count } = req.body;
-        if (!title || !content) {
-            console.log('Missing required fields:', { title: !!title, content: !!content });
-            return res.status(400).json({ error: 'Missing required fields' });
-        }
+        // Use the token from the authenticateUser middleware
+        const token = req.token;
+        const user = req.user;
 
         console.log('Saving transcript for user:', {
+            userId: user.id,
             email: user.email,
-            id: user.id,
-            title,
-            contentLength: content.length,
-            duration,
-            speaker_count
+            hasToken: !!token
         });
 
-        // Create a new client with the auth token
-        const supabaseWithAuth = createClient(
-            process.env.SUPABASE_URL,
-            process.env.SUPABASE_ANON_KEY,
-            {
-                global: {
-                    headers: {
-                        Authorization: `Bearer ${token}`
-                    }
-                }
-            }
-        );
-
-        // Save transcript using the authenticated client
-        const { data, error } = await supabaseWithAuth
+        const { title, content, summary, duration, speakerCount, audioUrl } = req.body;
+        
+        // Use the authenticated client with the current token
+        const client = getAuthenticatedClient(token);
+        
+        const { data: transcript, error: transcriptError } = await client
             .from('transcripts')
             .insert([{
-                id: user.id,
-                title,
-                content,
-                summary: '', // Start with empty summary
-                duration,
-                speaker_count,
-                audio_url: null
+                user_id: user.id,
+                title: title || 'Untitled Transcript',
+                content: content,
+                summary: summary,
+                duration: duration || 0,
+                speaker_count: speakerCount || 1,
+                audio_url: audioUrl,
+                created_at: new Date().toISOString()
             }])
-            .select();
+            .select()
+            .single();
 
-        if (error) {
-            console.error('Error saving transcript to database:', error);
-            return res.status(500).json({ 
-                error: 'Failed to save transcript',
-                details: error.message
-            });
+        if (transcriptError) {
+            console.error('Error saving transcript:', transcriptError);
+            throw transcriptError;
         }
 
-        console.log('Transcript saved successfully');
-
-        // Try to generate summary in the background
-        try {
-            const summary = await generateMeetingSummary(content);
-            if (summary) {
-                // Update the transcript with the summary
-                const { error: updateError } = await supabaseWithAuth
-                    .from('transcripts')
-                    .update({ summary })
-                    .eq('id', data[0].id);
-
-                if (updateError) {
-                    console.error('Error updating transcript with summary:', updateError);
-                } else {
-                    console.log('Summary added to transcript');
-                }
-            }
-        } catch (summaryError) {
-            console.error('Error generating summary:', summaryError);
-            // Don't fail the request if summary generation fails
-        }
-
-        res.json(data);
-    } catch (error) {
-        console.error('Error in /api/transcripts endpoint:', error);
-        res.status(500).json({ 
-            error: 'Failed to save transcript',
-            details: error.message
+        console.log('Transcript saved successfully:', {
+            transcriptId: transcript.id,
+            userId: user.id
         });
+
+        res.json(transcript);
+    } catch (error) {
+        console.error('Error saving transcript:', error);
+        res.status(500).json({ error: error.message });
     }
 });
 
@@ -628,8 +758,7 @@ console.log('Starting server...');
 
 // Start the server
 server.listen(port, () => {
-    console.log(`Server running at http://localhost:${port}`);
-    console.log(`WebSocket server running on ws://localhost:${port}`);
+    console.log(`Server running in ${process.env.NODE_ENV || 'development'} mode on port ${port}`);
 });
 
 // Add error handling for uncaught exceptions

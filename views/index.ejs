@@ -22,7 +22,8 @@
                 auth: {
                     autoRefreshToken: true,
                     persistSession: true,
-                    detectSessionInUrl: true
+                    detectSessionInUrl: true,
+                    storage: window.localStorage // Explicitly use localStorage
                 }
             }
         );
@@ -43,30 +44,163 @@
             keyLength: window.SUPABASE_CONFIG.key?.length
         });
 
-        // Check for existing session on page load
-        supabase.auth.getSession().then(({ data: { session }, error }) => {
-            console.log('Initial session check:', {
-                hasSession: !!session,
-                hasError: !!error,
-                errorMessage: error?.message,
-                userEmail: session?.user?.email
-            });
-            
-            if (error) {
-                console.error('Error getting session:', error);
+        // Add a function to initialize app state
+        async function initializeAppState(session) {
+            if (!session) {
+                console.error('No session provided to initializeAppState');
+                document.getElementById('authContainer').style.display = 'flex';
+                document.getElementById('mainContent').style.display = 'none';
                 return;
             }
-            if (session) {
-                console.log('Found existing session');
+
+            console.log('Initializing app state with session:', {
+                hasSession: true,
+                userEmail: session.user.email,
+                userId: session.user.id
+            });
+
+            try {
                 currentUser = session.user;
+                currentSession = session;
+                
+                // Update UI
                 document.getElementById('authContainer').style.display = 'none';
                 document.getElementById('mainContent').style.display = 'block';
                 updateUserProfile(session.user);
-            } else {
-                console.log('No existing session');
+
+                // Initialize real-time subscriptions
+                await initializeRealTimeSubscriptions(session);
+                
+                // Load user data
+                await loadPastTranscripts();
+                await loadMeetings();
+
+                console.log('App state initialized successfully');
+            } catch (error) {
+                console.error('Error initializing app state:', error);
+                // Don't clear the session here, let the auth state change handler handle that
+                throw error;
+            }
+        }
+
+        // Add function to initialize real-time subscriptions
+        async function initializeRealTimeSubscriptions(session) {
+            try {
+                // Clean up any existing subscriptions
+                if (transcriptsSubscription) {
+                    console.log('Cleaning up existing subscription...');
+                    transcriptsSubscription.unsubscribe();
+                    transcriptsSubscription = null;
+                }
+
+                // Set up new subscription
+                console.log('Setting up real-time subscription...');
+                transcriptsSubscription = supabase
+                    .channel('transcripts-changes')
+                    .on(
+                        'postgres_changes',
+                        {
+                            event: '*',
+                            schema: 'public',
+                            table: 'transcripts',
+                            filter: `id=eq.${session.user.id}`
+                        },
+                        (payload) => {
+                            console.log('Real-time update received:', payload);
+                            handleTranscriptChange(payload);
+                        }
+                    )
+                    .subscribe((status) => {
+                        console.log('Subscription status:', status);
+                    });
+            } catch (error) {
+                console.error('Error initializing real-time subscriptions:', error);
+            }
+        }
+
+        // Check for existing session on page load
+        document.addEventListener('DOMContentLoaded', async () => {
+            try {
+                console.log('Checking for existing session...');
+                // Don't try to initialize app state here, let the auth state change handler do it
+                const { data: { session }, error } = await supabase.auth.getSession();
+                if (error) {
+                    console.error('Error getting initial session:', error);
+                    document.getElementById('authContainer').style.display = 'flex';
+                    document.getElementById('mainContent').style.display = 'none';
+                }
+                // The auth state change handler will handle initialization if there's a session
+            } catch (error) {
+                console.error('Error during initialization:', error);
                 document.getElementById('authContainer').style.display = 'flex';
                 document.getElementById('mainContent').style.display = 'none';
             }
+        });
+
+        // Update auth state change handler
+        supabase.auth.onAuthStateChange(async (event, session) => {
+            console.log('Auth state changed:', {
+                event,
+                hasSession: !!session,
+                userEmail: session?.user?.email
+            });
+
+            try {
+                switch (event) {
+                    case 'SIGNED_IN':
+                    case 'TOKEN_REFRESHED':
+                        if (session) {
+                            console.log('Processing sign in/refresh with session:', {
+                                userEmail: session.user.email,
+                                userId: session.user.id
+                            });
+                            await initializeAppState(session);
+                        }
+                        break;
+
+                    case 'SIGNED_OUT':
+                        // Clean up resources
+                        if (ws) {
+                            ws.close();
+                            ws = null;
+                        }
+                        if (transcriptsSubscription) {
+                            transcriptsSubscription.unsubscribe();
+                            transcriptsSubscription = null;
+                        }
+                        
+                        // Clear state
+                        currentUser = null;
+                        currentSession = null;
+                        fullTranscript = [];
+                        meetingStartTime = null;
+                        
+                        // Update UI
+                        document.getElementById('authContainer').style.display = 'flex';
+                        document.getElementById('mainContent').style.display = 'none';
+                        break;
+
+                    case 'INITIAL_SESSION':
+                        // Only initialize if we have a valid session
+                        if (session) {
+                            console.log('Initial session found, initializing app state');
+                            await initializeAppState(session);
+                        } else {
+                            console.log('No initial session found, showing auth container');
+                            document.getElementById('authContainer').style.display = 'flex';
+                            document.getElementById('mainContent').style.display = 'none';
+                        }
+                        break;
+                }
+            } catch (error) {
+                console.error('Error handling auth state change:', error);
+                // Show auth container on error
+                document.getElementById('authContainer').style.display = 'flex';
+                document.getElementById('mainContent').style.display = 'none';
+            }
+
+            // Re-setup navigation after auth state changes
+            setupNavigation();
         });
 
         // Global variables - declare these only once at the top level
@@ -74,6 +208,7 @@
         let ws = null;
         let fullTranscript = [];
         let meetingStartTime = new Date();
+        let isRecording = false;  // Add isRecording variable
         window.speakerNames = new Map();
 
         // Add a global variable to store the current session
@@ -81,6 +216,70 @@
 
         // Add this after the supabase client initialization
         let transcriptsSubscription = null;
+
+        // Navigation setup - Move this outside of DOMContentLoaded to ensure it's available
+        function setupNavigation() {
+            console.log('Setting up navigation...');
+            const navItems = document.querySelectorAll('.nav-item');
+            console.log('Found nav items:', navItems.length);
+
+            navItems.forEach(item => {
+                console.log('Setting up click handler for:', item.dataset.view);
+                
+                // Remove any existing click handlers
+                const newItem = item.cloneNode(true);
+                item.parentNode.replaceChild(newItem, item);
+                
+                newItem.addEventListener('click', async (e) => {
+                    e.preventDefault();
+                    console.log('Navigation item clicked:', newItem.dataset.view);
+                    
+                    try {
+                        // Remove active class from all items
+                        document.querySelectorAll('.nav-item').forEach(nav => {
+                            nav.classList.remove('active');
+                        });
+                        
+                        // Add active class to clicked item
+                        newItem.classList.add('active');
+
+                        // Hide all views
+                        document.querySelectorAll('.content-view').forEach(view => {
+                            view.classList.remove('active');
+                            console.log('Hiding view:', view.id);
+                        });
+                        
+                        // Show the selected view
+                        const viewId = `${newItem.dataset.view}-view`;
+                        console.log('Attempting to show view:', viewId);
+                        const targetView = document.getElementById(viewId);
+                        
+                        if (targetView) {
+                            console.log('Found target view, showing it');
+                            targetView.classList.add('active');
+                            
+                            // Load transcripts if we're on the transcripts view
+                            if (newItem.dataset.view === 'transcripts') {
+                                console.log('Loading transcripts for transcripts view...');
+                                await loadPastTranscripts();
+                            }
+                        } else {
+                            console.error('Target view not found:', viewId);
+                        }
+                    } catch (error) {
+                        console.error('Error handling navigation click:', error);
+                    }
+                });
+            });
+        }
+
+        // Call setupNavigation when DOM is loaded
+        document.addEventListener('DOMContentLoaded', () => {
+            console.log('DOM loaded, setting up navigation...');
+            setupNavigation();
+            
+            // ... rest of the existing DOMContentLoaded code ...
+        });
 
         // Wait for DOM to be fully loaded
         document.addEventListener('DOMContentLoaded', () => {
@@ -115,18 +314,17 @@
             if (logoutBtn) {
                 logoutBtn.addEventListener('click', async (e) => {
                     e.preventDefault();
-                    e.stopPropagation();
+                    console.log('Starting logout process...');
+
                     try {
-                        console.log('Starting logout process...');
-                        
-                        // Close WebSocket connection if it exists
+                        // Clean up WebSocket connection if it exists
                         if (ws) {
                             console.log('Closing WebSocket connection...');
                             ws.close();
                             ws = null;
                         }
 
-                        // Unsubscribe from real-time updates if active
+                        // Unsubscribe from real-time updates
                         if (transcriptsSubscription) {
                             console.log('Unsubscribing from real-time updates...');
                             transcriptsSubscription.unsubscribe();
@@ -134,43 +332,37 @@
                         }
 
                         // Clear any active recordings
-                        fullTranscript = [];
-                        meetingStartTime = null;
-                        
+                        if (isRecording) {
+                            console.log('Stopping active recording...');
+                            await stopRecording();
+                        }
+
                         // Clear session data
                         currentUser = null;
                         currentSession = null;
-                        
+                        fullTranscript = [];
+
                         // Sign out from Supabase
                         console.log('Signing out from Supabase...');
                         const { error } = await supabase.auth.signOut();
                         if (error) throw error;
-                        
-                        console.log('Successfully signed out');
-                        
+
                         // Update UI
                         document.getElementById('authContainer').style.display = 'flex';
                         document.getElementById('mainContent').style.display = 'none';
                         
-                        // Clear any error messages
-                        const authError = document.getElementById('authError');
-                        if (authError) {
-                            authError.style.display = 'none';
-                            authError.textContent = '';
+                        // Clear any notifications
+                        const notification = document.getElementById('notification');
+                        if (notification) {
+                            notification.remove();
                         }
-                        
-                        // Reset form if it exists
-                        const authForm = document.getElementById('authForm');
-                        if (authForm) {
-                            authForm.reset();
-                        }
-                        
+
                         // Reload the page to ensure clean state
+                        console.log('Logout successful, reloading page...');
                         window.location.reload();
-                        
                     } catch (error) {
                         console.error('Error during logout:', error);
-                        alert('Error signing out. Please try again.');
+                        showNotification('Error during logout. Please try again.');
                     }
                 });
             }
@@ -302,6 +494,7 @@
                 startRecordBtn.addEventListener('click', async () => {
                     try {
                         console.log('Start recording button clicked');
+                        isRecording = true;  // Set isRecording to true when starting
                         
                         // Check if we have a stored session
                         if (!currentSession) {
@@ -361,6 +554,8 @@
                     if (ws) {
                         try {
                             console.log('Stop recording button clicked');
+                            isRecording = false;  // Set isRecording to false when stopping
+                            
                             recordingStatus.innerHTML = 'Stopping recording and saving transcript...';
 
                             // First close the WebSocket connection
@@ -501,23 +696,43 @@
 
             // Navigation setup
             document.querySelectorAll('.nav-item').forEach(item => {
-                item.addEventListener('click', () => {
+                item.addEventListener('click', async () => {
+                    console.log('Navigation item clicked:', item.dataset.view);
+                    
+                    // Remove active class from all items
                     document.querySelectorAll('.nav-item').forEach(nav => {
                         nav.classList.remove('active');
                     });
+                    
+                    // Add active class to clicked item
                     item.classList.add('active');
 
-                    const viewId = `${item.dataset.view}-view`;
+                    // Hide all views
                     document.querySelectorAll('.content-view').forEach(view => {
                         view.classList.remove('active');
                     });
                     
+                    // Show the selected view
+                    const viewId = `${item.dataset.view}-view`;
                     const targetView = document.getElementById(viewId);
                     if (targetView) {
                         targetView.classList.add('active');
+                        
+                        // Load transcripts if we're on the transcripts view
+                        if (item.dataset.view === 'transcripts') {
+                            console.log('Loading transcripts for transcripts view...');
+                            await loadPastTranscripts();
+                        }
                     }
                 });
             });
+
+            // Remove the old event listener if it exists
+            const oldTranscriptsNav = document.querySelector('[data-view="transcripts"]');
+            if (oldTranscriptsNav) {
+                const newTranscriptsNav = oldTranscriptsNav.cloneNode(true);
+                oldTranscriptsNav.parentNode.replaceChild(newTranscriptsNav, oldTranscriptsNav);
+            }
 
             // Calendar view setup
             document.querySelector('[data-view="calendar"]')?.addEventListener('click', () => {
@@ -530,74 +745,6 @@
                     document.querySelectorAll('.calendar-view-selector button').forEach(b => b.classList.remove('active'));
                     button.classList.add('active');
                 });
-            });
-
-            // Auth state management
-            supabase.auth.onAuthStateChange(async (event, session) => {
-                console.log('Auth state changed:', {
-                    event,
-                    hasSession: !!session,
-                    userEmail: session?.user?.email,
-                    userId: session?.user?.id,
-                    accessToken: session?.access_token ? 'Present' : 'Missing',
-                    refreshToken: session?.refresh_token ? 'Present' : 'Missing'
-                });
-                
-                if (event === 'SIGNED_OUT' || !session) {
-                    console.log('Handling sign out...');
-                    currentUser = null;
-                    currentSession = null;
-                    document.getElementById('authContainer').style.display = 'flex';
-                    document.getElementById('mainContent').style.display = 'none';
-                } else if (session) {
-                    console.log('Handling sign in...');
-                    currentUser = session.user;
-                    currentSession = session;
-                    document.getElementById('authContainer').style.display = 'none';
-                    document.getElementById('mainContent').style.display = 'block';
-                    updateUserProfile(session.user);
-                    
-                    // Check if user exists in our users table
-                    try {
-                        console.log('Checking user record for:', session.user.id);
-                        const { data: userData, error: userError } = await supabase
-                            .from('users')
-                            .select('*')
-                            .eq('id', session.user.id)
-                            .single();
-
-                        if (userError) {
-                            console.error('Error checking user record:', userError);
-                        }
-
-                        if (!userData) {
-                            console.log('Creating new user record...');
-                            // Create user record if it doesn't exist
-                            const { data: newUser, error: createError } = await supabase
-                                .from('users')
-                                .insert([{
-                                    id: session.user.id,
-                                    email: session.user.email,
-                                    name: session.user.email.split('@')[0]
-                                }])
-                                .select()
-                                .single();
-                            
-                            if (createError) {
-                                console.error('Error creating user record:', createError);
-                            } else {
-                                console.log('User record created successfully:', newUser);
-                            }
-                        } else {
-                            console.log('Existing user record found:', userData);
-                        }
-                    } catch (error) {
-                        console.error('Error in user record management:', error);
-                    }
-                    
-                    loadPastTranscripts();
-                    loadMeetings();
-                }
             });
         });
 
@@ -622,47 +769,91 @@
 
         // Load past transcripts from Supabase
         async function loadPastTranscripts() {
+            console.log('Starting loadPastTranscripts function...');
             const container = document.getElementById('transcriptsContainer');
-            
+            if (!container) {
+                console.error('Transcripts container not found');
+                return;
+            }
+
             try {
-                const { data: { session } } = await supabase.auth.getSession();
-                if (!session) return;
+                console.log('Loading past transcripts...');
+                
+                // Ensure we have a valid session before proceeding
+                console.log('Getting session...');
+                const session = await ensureValidSession();
+                console.log('Session details:', {
+                    hasSession: !!session,
+                    hasAccessToken: !!session?.access_token,
+                    userId: session?.user?.id,
+                    userEmail: session?.user?.email,
+                    tokenExpiry: session?.expires_at ? new Date(session.expires_at * 1000).toISOString() : 'N/A',
+                    accessTokenLength: session?.access_token?.length,
+                    accessToken: session?.access_token ? `${session.access_token.substring(0, 10)}...` : 'none'
+                });
 
-                // First, load existing transcripts
-                const { data: transcripts, error } = await supabase
-                    .from('transcripts')
-                    .select('*')
-                    .order('created_at', { ascending: false });
-
-                if (error) throw error;
-
-                // Render the transcripts
-                renderTranscripts(transcripts || []);
-
-                // Set up real-time subscription
-                if (transcriptsSubscription) {
-                    transcriptsSubscription.unsubscribe();
+                if (!session?.access_token) {
+                    throw new Error('No access token available');
                 }
 
-                transcriptsSubscription = supabase
-                    .channel('transcripts-changes')
-                    .on(
-                        'postgres_changes',
-                        {
-                            event: '*', // Listen for all events (INSERT, UPDATE, DELETE)
-                            schema: 'public',
-                            table: 'transcripts',
-                            filter: `user_id=eq.${session.user.id}` // Only listen for current user's transcripts
-                        },
-                        (payload) => {
-                            console.log('Real-time update received:', payload);
-                            handleTranscriptChange(payload);
-                        }
-                    )
-                    .subscribe();
+                const requestHeaders = {
+                    'Authorization': `Bearer ${session.access_token}`,
+                    'Accept': 'application/json'
+                };
 
+                console.log('Making fetch request to /api/transcripts with headers:', {
+                    ...requestHeaders,
+                    'Authorization': 'Bearer [REDACTED]'
+                });
+
+                const response = await fetch('/api/transcripts', {
+                    method: 'GET',
+                    headers: requestHeaders
+                });
+
+                console.log('Transcript fetch response:', {
+                    status: response.status,
+                    ok: response.ok,
+                    statusText: response.statusText,
+                    headers: Object.fromEntries(response.headers.entries()),
+                    url: response.url
+                });
+
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    console.error('Server error response:', errorData);
+                    throw new Error(errorData.error || 'Failed to fetch transcripts');
+                }
+
+                const transcripts = await response.json();
+                console.log('Received transcripts:', {
+                    count: transcripts.length,
+                    firstTranscript: transcripts[0] ? {
+                        id: transcripts[0].id,
+                        transcript_id: transcripts[0].transcript_id,
+                        title: transcripts[0].title,
+                        created_at: transcripts[0].created_at,
+                        content_length: transcripts[0].content?.length
+                    } : null,
+                    rawData: transcripts
+                });
+
+                if (!Array.isArray(transcripts)) {
+                    console.error('Invalid transcripts data:', transcripts);
+                    throw new Error('Invalid transcripts data received from server');
+                }
+
+                console.log('Rendering transcripts...');
+                renderTranscripts(transcripts);
+                console.log('Transcripts rendered successfully');
             } catch (error) {
-                console.error('Error loading transcripts:', error);
+                console.error('Error in loadPastTranscripts:', error);
+                console.error('Error stack:', error.stack);
+                if (error.message === 'No active session') {
+                    // Redirect to login if no session
+                    document.getElementById('authContainer').style.display = 'flex';
+                    document.getElementById('mainContent').style.display = 'none';
+                }
                 container.innerHTML = `
                     <div class="error">
                         <h2>Error loading transcripts</h2>
@@ -672,54 +863,89 @@
             }
         }
 
-        // Add new function to handle real-time updates
+        // Update the real-time subscription handler
         function handleTranscriptChange(payload) {
+            console.log('Handling transcript change:', payload);
             const container = document.getElementById('transcriptsContainer');
-            if (!container) return;
-
-            // Get current transcripts from the DOM
-            const currentTranscripts = Array.from(container.querySelectorAll('.transcript-card')).map(card => ({
-                id: card.dataset.transcriptId,
-                created_at: card.dataset.createdAt,
-                title: card.querySelector('.transcript-title').textContent,
-                summary: card.querySelector('.transcript-summary').textContent,
-                duration: parseInt(card.dataset.duration)
-            }));
-
-            let updatedTranscripts = [...currentTranscripts];
-
-            switch (payload.eventType) {
-                case 'INSERT':
-                    // Add new transcript at the beginning
-                    updatedTranscripts.unshift(payload.new);
-                    break;
-                case 'UPDATE':
-                    // Update existing transcript
-                    updatedTranscripts = updatedTranscripts.map(t => 
-                        t.id === payload.new.id ? payload.new : t
-                    );
-                    break;
-                case 'DELETE':
-                    // Remove deleted transcript
-                    updatedTranscripts = updatedTranscripts.filter(t => t.id !== payload.old.id);
-                    break;
+            if (!container) {
+                console.error('Transcripts container not found');
+                return;
             }
 
-            // Re-render the transcripts
-            renderTranscripts(updatedTranscripts);
+            try {
+                // Get current transcripts from the DOM
+                const currentTranscripts = Array.from(container.querySelectorAll('.transcript-card')).map(card => ({
+                    id: card.dataset.transcriptId,
+                    created_at: card.dataset.createdAt,
+                    title: card.querySelector('.transcript-title').textContent,
+                    summary: card.querySelector('.transcript-summary').textContent,
+                    duration: parseInt(card.dataset.duration)
+                }));
 
-            // Show a notification for new transcripts
-            if (payload.eventType === 'INSERT') {
-                showNotification('New transcript available!');
+                let updatedTranscripts = [...currentTranscripts];
+
+                switch (payload.eventType) {
+                    case 'INSERT':
+                        console.log('Inserting new transcript:', payload.new);
+                        // Add new transcript at the beginning
+                        updatedTranscripts.unshift(payload.new);
+                        break;
+                    case 'UPDATE':
+                        console.log('Updating transcript:', payload.new);
+                        // Update existing transcript
+                        updatedTranscripts = updatedTranscripts.map(t => 
+                            t.id === payload.new.id ? payload.new : t
+                        );
+                        break;
+                    case 'DELETE':
+                        console.log('Deleting transcript:', payload.old);
+                        // Remove deleted transcript
+                        updatedTranscripts = updatedTranscripts.filter(t => t.id !== payload.old.id);
+                        break;
+                    default:
+                        console.log('Unknown event type:', payload.eventType);
+                        return;
+                }
+
+                console.log('Updated transcripts:', {
+                    count: updatedTranscripts.length,
+                    firstTranscript: updatedTranscripts[0] ? {
+                        id: updatedTranscripts[0].id,
+                        title: updatedTranscripts[0].title
+                    } : null
+                });
+
+                // Re-render the transcripts
+                renderTranscripts(updatedTranscripts);
+
+                // Show a notification for new transcripts
+                if (payload.eventType === 'INSERT') {
+                    showNotification('New transcript available!');
+                }
+            } catch (error) {
+                console.error('Error handling transcript change:', error);
+                // Reload all transcripts on error
+                loadPastTranscripts();
             }
         }
 
-        // Add function to render transcripts
+        // Update the renderTranscripts function
         function renderTranscripts(transcripts) {
-            const container = document.getElementById('transcriptsContainer');
-            if (!container) return;
+            console.log('Rendering transcripts:', {
+                count: transcripts.length,
+                firstTranscript: transcripts[0] ? {
+                    id: transcripts[0].id,
+                    title: transcripts[0].title
+                } : null
+            });
 
-            if (transcripts.length === 0) {
+            const container = document.getElementById('transcriptsContainer');
+            if (!container) {
+                console.error('Transcripts container not found');
+                return;
+            }
+
+            if (!Array.isArray(transcripts) || transcripts.length === 0) {
                 container.innerHTML = `
                     <div class="no-transcripts">
                         <h2>No transcripts found</h2>
@@ -729,20 +955,25 @@
                 return;
             }
 
-            container.innerHTML = transcripts.map(transcript => `
+            // Sort transcripts by created_at in descending order
+            const sortedTranscripts = [...transcripts].sort((a, b) => 
+                new Date(b.created_at) - new Date(a.created_at)
+            );
+
+            container.innerHTML = sortedTranscripts.map(transcript => `
                 <div class="transcript-card" 
                      data-transcript-id="${transcript.id}"
                      data-created-at="${transcript.created_at}"
-                     data-duration="${transcript.duration}">
+                     data-duration="${transcript.duration || 0}">
                     <div class="transcript-card-content">
                         <div class="transcript-card-top">
                             <div class="transcript-date">${formatDate(transcript.created_at)}</div>
                             <div class="transcript-duration">
                                 <i class="fas fa-clock"></i>
-                                ${formatDuration(transcript.duration)}
+                                ${formatDuration(transcript.duration || 0)}
                             </div>
                         </div>
-                        <h3 class="transcript-title">${transcript.title}</h3>
+                        <h3 class="transcript-title">${transcript.title || 'Untitled Transcript'}</h3>
                         <p class="transcript-summary">${transcript.summary || 'No summary available'}</p>
                     </div>
                     <div class="transcript-card-actions">
@@ -789,13 +1020,37 @@
         });
 
         // Meeting management
-        function startMeeting() {
+        async function startMeeting() {
             if (!ws) {
                 try {
+                    // Get current session before creating WebSocket
+                    const { data: { session }, error: sessionError } = await supabase.auth.getSession();
+                    if (sessionError) {
+                        console.error('Error getting session:', sessionError);
+                        throw sessionError;
+                    }
+                    
+                    if (!session) {
+                        console.error('No active session found');
+                        throw new Error('No active session found. Please log in again.');
+                    }
+
+                    console.log('Starting WebSocket connection with session:', {
+                        hasSession: !!session,
+                        userId: session.user.id,
+                        hasAccessToken: !!session.access_token
+                    });
+
                     ws = new WebSocket('ws://localhost:3000');
                     
-                    ws.onopen = () => {
-                        console.log('WebSocket connection established');
+                    ws.onopen = async () => {
+                        console.log('WebSocket connection established, sending auth...');
+                        // Send authentication message with token
+                        ws.send(JSON.stringify({
+                            type: 'auth',
+                            token: session.access_token
+                        }));
+                        
                         startNewRecording();
                         // Show the transcript and Q&A sections when connection is established
                         const transcriptSection = document.getElementById('transcriptSection');
@@ -811,6 +1066,17 @@
                             console.log('Received WebSocket message:', event.data);
                             const data = JSON.parse(event.data);
                             console.log('Parsed WebSocket data:', data);
+                            
+                            // Handle auth response
+                            if (data.type === 'auth_response') {
+                                if (data.error) {
+                                    console.error('WebSocket authentication failed:', data.error);
+                                    ws.close();
+                                    throw new Error('WebSocket authentication failed: ' + data.error);
+                                }
+                                console.log('WebSocket authenticated successfully');
+                                return;
+                            }
                             
                             // Skip empty messages
                             if (!data.text || data.text.trim() === '') {
@@ -851,6 +1117,7 @@
                 } catch (error) {
                     console.error('Error creating WebSocket:', error);
                     ws = null;
+                    alert('Error starting recording: ' + error.message);
                 }
             }
         }
@@ -1023,62 +1290,80 @@
             });
         }
 
-        async function saveTranscript() {
+        // Function to save transcript
+        async function saveTranscript(transcriptData) {
             try {
-                console.log('Starting transcript save process...');
-                console.log('Current session state:', {
-                    exists: !!currentSession,
-                    user: currentSession?.user,
-                    accessToken: currentSession?.access_token
-                });
-
-                if (!currentSession?.access_token) {
-                    throw new Error('No valid session found');
+                // Get the current session
+                const { data: { session }, error: sessionError } = await supabase.auth.getSession();
+                if (sessionError) {
+                    console.error('Session error:', sessionError);
+                    throw sessionError;
+                }
+                
+                if (!session) {
+                    console.log('No active session, redirecting to login...');
+                    window.location.href = '/';
+                    return;
                 }
 
-                // Format the transcript content
-                const transcriptText = fullTranscript
-                    .map(line => `${line.displayName}: ${line.text}`)
-                    .join('\n');
-
-                const requestBody = {
-                    id: currentSession.user.id,  // This should match auth.uid()
-                    title: `Meeting ${new Date().toLocaleString()}`,
-                    content: transcriptText,
-                    duration: Math.round((new Date() - meetingStartTime) / 1000),
-                    speaker_count: new Set(fullTranscript.map(t => t.speakerId)).size
-                };
-
-                console.log('Sending transcript save request with body:', {
-                    id: requestBody.id,
-                    title: requestBody.title,
-                    contentLength: requestBody.content.length,
-                    duration: requestBody.duration,
-                    speakerCount: requestBody.speaker_count,
-                    hasAccessToken: !!currentSession.access_token
+                console.log('Saving transcript with session:', {
+                    hasSession: !!session,
+                    userId: session.user.id,
+                    hasAccessToken: !!session.access_token,
+                    hasRefreshToken: !!session.refresh_token
                 });
 
-                // Log the first few lines of content for debugging
-                console.log('First few lines of content:', requestBody.content.split('\n').slice(0, 3));
+                // Check if token is about to expire (within 5 minutes)
+                const expiresAt = session.expires_at * 1000; // Convert to milliseconds
+                const now = Date.now();
+                if (expiresAt - now < 5 * 60 * 1000) { // 5 minutes
+                    console.log('Token about to expire, refreshing...');
+                    const { data: { session: newSession }, error: refreshError } = await supabase.auth.refreshSession();
+                    if (refreshError) {
+                        console.error('Error refreshing session:', refreshError);
+                        throw refreshError;
+                    }
+                    session = newSession;
+                }
 
                 const response = await fetch('/api/transcripts', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
-                        'Authorization': `Bearer ${currentSession.access_token}`
+                        'Authorization': `Bearer ${session.access_token}`
                     },
-                    body: JSON.stringify(requestBody)
+                    body: JSON.stringify(transcriptData)
                 });
 
                 if (!response.ok) {
-                    const errorData = await response.json();
-                    console.error('Server error response:', errorData);
-                    throw new Error(errorData.error || 'Failed to save transcript');
+                    if (response.status === 401) {
+                        // Try to refresh the session
+                        const { data: { session: newSession }, error: refreshError } = await supabase.auth.refreshSession();
+                        if (refreshError) {
+                            console.error('Error refreshing session:', refreshError);
+                            throw refreshError;
+                        }
+                        
+                        // Retry the request with the new token
+                        const retryResponse = await fetch('/api/transcripts', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'Authorization': `Bearer ${newSession.access_token}`
+                            },
+                            body: JSON.stringify(transcriptData)
+                        });
+                        
+                        if (!retryResponse.ok) {
+                            throw new Error('Failed to save transcript after token refresh');
+                        }
+                        
+                        return await retryResponse.json();
+                    }
+                    throw new Error('Failed to save transcript');
                 }
 
-                const data = await response.json();
-                console.log('Transcript saved successfully:', data);
-                return data;
+                return await response.json();
             } catch (error) {
                 console.error('Error saving transcript:', error);
                 throw error;
@@ -1165,6 +1450,41 @@
             console.log('Viewing transcript:', transcriptId);
             // You can implement the actual viewing logic here
             // For example, opening a modal or navigating to a detailed view
+        }
+
+        // Add a function to ensure we have a valid session
+        async function ensureValidSession() {
+            try {
+                console.log('Ensuring valid session...');
+                const { data: { session }, error } = await supabase.auth.getSession();
+                
+                if (error) {
+                    console.error('Error getting session:', error);
+                    throw error;
+                }
+
+                if (!session) {
+                    console.error('No session found');
+                    throw new Error('No active session');
+                }
+
+                // Check if the token is expired
+                const tokenExpiry = new Date(session.expires_at * 1000);
+                if (tokenExpiry <= new Date()) {
+                    console.log('Token expired, refreshing...');
+                    const { data: { session: newSession }, error: refreshError } = await supabase.auth.refreshSession();
+                    if (refreshError) throw refreshError;
+                    if (!newSession) throw new Error('Failed to refresh session');
+                    currentSession = newSession;
+                    return newSession;
+                }
+
+                currentSession = session;
+                return session;
+            } catch (error) {
+                console.error('Error ensuring valid session:', error);
+                throw error;
+            }
         }
     </script>
     <style>

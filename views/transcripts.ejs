@@ -5,6 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Past Transcripts</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <!-- Add Supabase client -->
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
     <style>
         * {
             margin: 0;
@@ -125,10 +128,76 @@
             border-radius: 12px;
             box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
         }
+
+        /* Add navigation styles */
+        .nav-container {
+            background: white;
+            padding: 1rem;
+            margin-bottom: 2rem;
+            border-radius: 12px;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+        }
+
+        .nav-list {
+            display: flex;
+            gap: 1rem;
+            list-style: none;
+        }
+
+        .nav-item {
+            padding: 0.5rem 1rem;
+            border-radius: 6px;
+            cursor: pointer;
+            color: #666;
+            text-decoration: none;
+            transition: background-color 0.2s;
+        }
+
+        .nav-item:hover {
+            background-color: #f5f7fb;
+        }
+
+        .nav-item.active {
+            background-color: #e6e9f0;
+            color: #1a1a1a;
+            font-weight: 500;
+        }
+
+        /* Add button styles */
+        .view-transcript-btn {
+            background: #4a90e2;
+            color: white;
+            border: none;
+            padding: 0.5rem 1rem;
+            border-radius: 6px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            transition: background-color 0.2s;
+        }
+
+        .view-transcript-btn:hover {
+            background: #357abd;
+        }
+
+        .transcript-card-actions {
+            margin-top: 1rem;
+            display: flex;
+            justify-content: flex-end;
+        }
     </style>
 </head>
 <body>
     <div class="container">
+        <!-- Add navigation -->
+        <nav class="nav-container">
+            <ul class="nav-list">
+                <li><a href="/" class="nav-item">Home</a></li>
+                <li><a href="/transcripts" class="nav-item active">Past Transcripts</a></li>
+            </ul>
+        </nav>
+
         <div class="header">
             <h1>Past Transcripts</h1>
             <p>View and manage your meeting transcripts</p>
@@ -140,6 +209,50 @@
     </div>
 
     <script>
+        // Initialize Supabase client with proper configuration
+        const supabase = supabase.createClient(
+            '<%= process.env.SUPABASE_URL %>',
+            '<%= process.env.SUPABASE_ANON_KEY %>',
+            {
+                auth: {
+                    autoRefreshToken: true,
+                    persistSession: true,
+                    detectSessionInUrl: true,
+                    storage: window.localStorage
+                }
+            }
+        );
+
+        // Set initial session from server
+        const initialSession = JSON.parse('<%- JSON.stringify(initialSession || null) %>');
+        if (initialSession) {
+            console.log('Setting initial session from server:', {
+                hasAccessToken: !!initialSession.access_token,
+                hasRefreshToken: !!initialSession.refresh_token,
+                userId: initialSession.user?.id
+            });
+            
+            // Set the session in Supabase
+            supabase.auth.setSession({
+                access_token: initialSession.access_token,
+                refresh_token: initialSession.refresh_token
+            }).then(({ data: { session }, error }) => {
+                if (error) {
+                    console.error('Error setting initial session:', error);
+                    window.location.href = '/';
+                    return;
+                }
+                
+                if (session) {
+                    console.log('Initial session set successfully');
+                    loadTranscripts();
+                } else {
+                    console.log('No session after setting initial session');
+                    window.location.href = '/';
+                }
+            });
+        }
+
         // Format date to DD/MM/YYYY
         function formatDate(dateString) {
             const date = new Date(dateString);
@@ -164,60 +277,173 @@
         // Load transcripts
         async function loadTranscripts() {
             const container = document.getElementById('transcriptsContainer');
+            container.innerHTML = '<div class="loading">Loading transcripts...</div>';
             
             try {
+                // Get the current session
+                const { data: { session }, error: sessionError } = await supabase.auth.getSession();
+                if (sessionError) {
+                    console.error('Session error:', sessionError);
+                    throw sessionError;
+                }
+                
+                if (!session) {
+                    console.log('No active session, redirecting to login...');
+                    window.location.href = '/';
+                    return;
+                }
+
+                console.log('Loading transcripts with session:', {
+                    hasSession: !!session,
+                    userId: session.user.id,
+                    hasAccessToken: !!session.access_token,
+                    hasRefreshToken: !!session.refresh_token,
+                    expiresAt: session.expires_at
+                });
+
+                // Check if token is about to expire (within 5 minutes)
+                const expiresAt = session.expires_at * 1000; // Convert to milliseconds
+                const now = Date.now();
+                if (expiresAt - now < 5 * 60 * 1000) { // 5 minutes
+                    console.log('Token about to expire, refreshing...');
+                    const { data: { session: newSession }, error: refreshError } = await supabase.auth.refreshSession();
+                    if (refreshError) {
+                        console.error('Error refreshing session:', refreshError);
+                        throw refreshError;
+                    }
+                    session = newSession;
+                }
+
                 const response = await fetch('/api/transcripts', {
                     headers: {
-                        'Authorization': `Bearer ${localStorage.getItem('supabase.auth.token')}`
+                        'Authorization': `Bearer ${session.access_token}`
                     }
                 });
 
                 if (!response.ok) {
+                    if (response.status === 401) {
+                        // Try to refresh the session
+                        const { data: { session: newSession }, error: refreshError } = await supabase.auth.refreshSession();
+                        if (refreshError) {
+                            console.error('Error refreshing session:', refreshError);
+                            window.location.href = '/';
+                            return;
+                        }
+                        
+                        // Retry the request with the new token
+                        const retryResponse = await fetch('/api/transcripts', {
+                            headers: {
+                                'Authorization': `Bearer ${newSession.access_token}`
+                            }
+                        });
+                        
+                        if (!retryResponse.ok) {
+                            throw new Error('Failed to fetch transcripts after token refresh');
+                        }
+                        
+                        const transcripts = await retryResponse.json();
+                        renderTranscripts(transcripts);
+                        return;
+                    }
                     throw new Error('Failed to fetch transcripts');
                 }
 
                 const transcripts = await response.json();
-
-                if (transcripts.length === 0) {
-                    container.innerHTML = `
-                        <div class="no-transcripts">
-                            <h2>No transcripts found</h2>
-                            <p>Your meeting transcripts will appear here</p>
-                        </div>
-                    `;
-                    return;
-                }
-
-                container.innerHTML = `
-                    <div class="transcripts-grid">
-                        ${transcripts.map(transcript => `
-                            <div class="transcript-card">
-                                <div class="transcript-date">${formatDate(transcript.created_at)}</div>
-                                <h3 class="transcript-title">${transcript.title}</h3>
-                                <p class="transcript-summary">${transcript.summary || 'No summary available'}</p>
-                                <div class="transcript-meta">
-                                    <div class="transcript-duration">
-                                        <i class="fas fa-clock"></i>
-                                        ${formatDuration(transcript.duration)}
-                                    </div>
-                                </div>
-                            </div>
-                        `).join('')}
-                    </div>
-                `;
+                renderTranscripts(transcripts);
             } catch (error) {
                 console.error('Error loading transcripts:', error);
                 container.innerHTML = `
                     <div class="error">
                         <h2>Error loading transcripts</h2>
                         <p>${error.message}</p>
+                        <button onclick="window.location.reload()">Retry</button>
                     </div>
                 `;
             }
         }
 
+        // Separate function to render transcripts
+        function renderTranscripts(transcripts) {
+            const container = document.getElementById('transcriptsContainer');
+            
+            if (transcripts.length === 0) {
+                container.innerHTML = `
+                    <div class="no-transcripts">
+                        <h2>No transcripts found</h2>
+                        <p>Your meeting transcripts will appear here</p>
+                    </div>
+                `;
+                return;
+            }
+
+            // Sort transcripts by created_at in descending order
+            const sortedTranscripts = [...transcripts].sort((a, b) => 
+                new Date(b.created_at) - new Date(a.created_at)
+            );
+
+            container.innerHTML = `
+                <div class="transcripts-grid">
+                    ${sortedTranscripts.map(transcript => `
+                        <div class="transcript-card" 
+                             data-transcript-id="${transcript.id}"
+                             data-created-at="${transcript.created_at}"
+                             data-duration="${transcript.duration || 0}">
+                            <div class="transcript-card-content">
+                                <div class="transcript-card-top">
+                                    <div class="transcript-date">${formatDate(transcript.created_at)}</div>
+                                    <div class="transcript-duration">
+                                        <i class="fas fa-clock"></i>
+                                        ${formatDuration(transcript.duration || 0)}
+                                    </div>
+                                </div>
+                                <h3 class="transcript-title">${transcript.title || 'Untitled Transcript'}</h3>
+                                <p class="transcript-summary">${transcript.summary || 'No summary available'}</p>
+                            </div>
+                            <div class="transcript-card-actions">
+                                <button class="view-transcript-btn" onclick="viewTranscript('${transcript.id}')">
+                                    <i class="fas fa-eye"></i>
+                                    View Transcript
+                                </button>
+                            </div>
+                        </div>
+                    `).join('')}
+                </div>
+            `;
+        }
+
+        // Add auth state change listener
+        supabase.auth.onAuthStateChange((event, session) => {
+            console.log('Auth state changed:', {
+                event,
+                hasSession: !!session,
+                userEmail: session?.user?.email,
+                hasRefreshToken: !!session?.refresh_token
+            });
+
+            if (event === 'SIGNED_OUT') {
+                window.location.href = '/';  // Redirect to main page for login
+            } else if (event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED') {
+                loadTranscripts();  // Reload transcripts when signed in or token refreshed
+            }
+        });
+
+        // Add view transcript function
+        function viewTranscript(transcriptId) {
+            console.log('Viewing transcript:', transcriptId);
+            // TODO: Implement transcript viewing functionality
+        }
+
         // Load transcripts when page loads
-        document.addEventListener('DOMContentLoaded', loadTranscripts);
+        document.addEventListener('DOMContentLoaded', () => {
+            // If we have an initial session, load transcripts immediately
+            if (initialSession) {
+                console.log('Using initial session to load transcripts');
+                loadTranscripts();
+            } else {
+                // Otherwise wait for auth state change
+                console.log('No initial session, waiting for auth state change');
+            }
+        });
     </script>
 </body>
 </html> 

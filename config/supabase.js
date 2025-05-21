@@ -1,30 +1,174 @@
 const { createClient } = require('@supabase/supabase-js');
 require('dotenv').config();
 
-// Initialize Supabase client
+// Validate required environment variables
+const requiredEnvVars = [
+    'SUPABASE_URL',
+    'SUPABASE_ANON_KEY'
+];
+
+const missingEnvVars = requiredEnvVars.filter(envVar => !process.env[envVar]);
+if (missingEnvVars.length > 0) {
+    throw new Error(`Missing required environment variables: ${missingEnvVars.join(', ')}`);
+}
+
+// Initialize Supabase client with anon key
 const supabase = createClient(
     process.env.SUPABASE_URL,
-    process.env.SUPABASE_ANON_KEY,
-    {
-        auth: {
-            autoRefreshToken: true,
-            persistSession: true,
-            detectSessionInUrl: true
-        }
-    }
+    process.env.SUPABASE_ANON_KEY
 );
 
-// Add a function to verify the auth state
-async function verifyAuth(token) {
+// Get an authenticated client for a specific user
+const getAuthenticatedClient = (token) => {
+    console.log('getAuthenticatedClient called with token:', token ? token.substring(0, 20) + '...' : 'no token');
+    
+    // Ensure token is properly formatted
+    if (token && token.startsWith('Bearer ')) {
+        token = token.split(' ')[1];
+    }
+
+    return createClient(
+        process.env.SUPABASE_URL,
+        process.env.SUPABASE_ANON_KEY,
+        {
+            global: {
+                headers: {
+                    Authorization: `Bearer ${token}`
+                }
+            }
+        }
+    );
+};
+
+// Verify authentication token
+const verifyAuth = async (token) => {
     try {
         const { data: { user }, error } = await supabase.auth.getUser(token);
         if (error) throw error;
-        return { user, error: null };
+        return user;
     } catch (error) {
-        console.error('Auth verification error:', error);
-        return { user: null, error };
+        console.error('Auth verification error:', error.message);
+        return null;
     }
-}
+};
+
+// Save transcript with user context
+const saveTranscript = async (token, transcript) => {
+    console.log('saveTranscript called with token:', token ? token.substring(0, 20) + '...' : 'no token');
+    
+    // Ensure token is properly formatted
+    if (token && token.startsWith('Bearer ')) {
+        token = token.split(' ')[1];
+    }
+
+    const client = getAuthenticatedClient(token);
+    const user = await verifyAuth(token);
+    if (!user) {
+        throw new Error('User not authenticated');
+    }
+
+    console.log('Saving transcript for user:', user.id);
+
+    const { data, error } = await client
+        .from('transcripts')
+        .insert([
+            {
+                id: user.id,  // This is the foreign key to users.id
+                title: transcript.title,
+                content: transcript.content,
+                summary: transcript.summary || '',
+                duration: transcript.duration || 0,
+                speaker_count: transcript.speakerCount || 0,
+                audio_url: transcript.audioUrl || null
+            }
+        ])
+        .select();
+
+    if (error) {
+        console.error('Error saving transcript:', error);
+        throw error;
+    }
+
+    console.log('Successfully saved transcript:', {
+        transcript_id: data[0].transcript_id,
+        id: data[0].id,
+        title: data[0].title
+    });
+
+    return data;
+};
+
+// Get transcripts with user context
+const getTranscripts = async (token) => {
+    console.log('getTranscripts called with token:', token ? token.substring(0, 20) + '...' : 'no token');
+
+    // Ensure token is properly formatted
+    if (token && token.startsWith('Bearer ')) {
+        token = token.split(' ')[1];
+    }
+
+    const client = getAuthenticatedClient(token);
+    console.log('Created authenticated client');
+
+    try {
+        // Get the user from the token
+        const user = await verifyAuth(token);
+        if (!user) {
+            throw new Error('User not authenticated');
+        }
+
+        // Query transcripts where id (user_id) matches the authenticated user
+        const { data, error } = await client
+            .from('transcripts')
+            .select('*')
+            .eq('id', user.id)  // id is the user_id foreign key
+            .order('created_at', { ascending: false });
+
+        if (error) {
+            console.error('Error in getTranscripts query:', error);
+            throw error;
+        }
+
+        console.log('Successfully retrieved transcripts:', {
+            count: data?.length || 0,
+            userId: user.id
+        });
+
+        return data;
+    } catch (error) {
+        console.error('Error in getTranscripts:', error);
+        throw error;
+    }
+};
+
+// Create meeting with user context
+const createMeeting = async (token, title) => {
+    const client = getAuthenticatedClient(token);
+    const { data, error } = await client
+        .from('meetings')
+        .insert([
+            {
+                title,
+                user_id: (await verifyAuth(token))?.id
+            }
+        ])
+        .select();
+
+    if (error) throw error;
+    return data[0];
+};
+
+// Get meetings with user context
+const getMeetings = async (token) => {
+    const client = getAuthenticatedClient(token);
+    const { data, error } = await client
+        .from('meetings')
+        .select('*')
+        .order('created_at', { ascending: false });
+
+    if (error) throw error;
+    return data;
+};
 
 // Database schema:
 /*
@@ -133,118 +277,10 @@ using (exists (
 
 module.exports = {
     supabase,
+    getAuthenticatedClient,
     verifyAuth,
-    // Helper functions for common database operations
-    async createUser(email, name) {
-        const { data: authUser, error: authError } = await supabase.auth.signUp({ email, password: 'temporaryPassword' });
-        if (authError) throw authError;
-        return await supabase
-            .from('users')
-            .insert([{ id: authUser.user.id, email, name }])
-            .select();
-    },
-
-    async getUser(userId) {
-        return await supabase
-            .from('users')
-            .select('*')
-            .eq('id', userId)
-            .single();
-    },
-
-    async saveTranscript(userId, { title, content, summary, duration, speakerCount, audioUrl }) {
-        try {
-            console.log('Attempting to save transcript to Supabase:', {
-                userId,
-                title,
-                contentLength: content.length,
-                summaryLength: summary.length,
-                duration,
-                speakerCount
-            });
-
-            // First verify the user exists
-            const { data: userData, error: userError } = await supabase
-                .from('users')
-                .select('id')
-                .eq('id', userId)
-                .single();
-
-            if (userError || !userData) {
-                console.error('Error verifying user:', userError);
-                throw new Error('User not found');
-            }
-
-            console.log('Inserting transcript...');
-            const { data, error } = await supabase
-                .from('transcripts')
-                .insert([{
-                    id: userId,  // This is the foreign key referencing users.id
-                    title,
-                    content,
-                    summary,
-                    duration,
-                    speaker_count: speakerCount,
-                    audio_url: audioUrl
-                }])
-                .select();
-
-            if (error) {
-                console.error('Error saving transcript to Supabase:', error);
-                throw error;
-            }
-
-            console.log('Transcript saved successfully to Supabase');
-            return { data, error: null };
-        } catch (error) {
-            console.error('Error in saveTranscript:', error);
-            return { data: null, error };
-        }
-    },
-
-    async getTranscripts(userId) {
-        return await supabase
-            .from('transcripts')
-            .select('*')
-            .eq('id', userId)
-            .order('created_at', { ascending: false });
-    },
-
-    async createMeeting(userId, { title, description, startTime, endTime }) {
-        return await supabase
-            .from('meetings')
-            .insert([{
-                id: userId,
-                title,
-                description,
-                start_time: startTime,
-                end_time: endTime
-            }])
-            .select();
-    },
-
-    async getMeetings(userId) {
-        return await supabase
-            .from('meetings')
-            .select(`
-                *,
-                meeting_participants (
-                    id,
-                    role
-                )
-            `)
-            .eq('id', userId)
-            .order('start_time', { ascending: true });
-    },
-
-    async addMeetingParticipant(meetingId, userId, role = 'participant') {
-        return await supabase
-            .from('meeting_participants')
-            .insert([{
-                meeting_id: meetingId,
-                id: userId,
-                role
-            }])
-            .select();
-    }
+    saveTranscript,
+    getTranscripts,
+    createMeeting,
+    getMeetings
 }; 

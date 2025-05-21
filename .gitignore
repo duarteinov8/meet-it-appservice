@@ -1,38 +1,35 @@
 # Dependencies
 node_modules/
-package-lock.json
+__pycache__/
+*.pyc
 
 # Environment variables
 .env
 .env.local
 .env.*.local
 
+# Build output
+dist/
+build/
+
 # Logs
-logs
+logs/
 *.log
 npm-debug.log*
 
 # Runtime data
-pids
-*.pid
-*.seed
-*.pid.lock
-
-# Directory for uploaded files
 uploads/
 transcripts/
 
-# IDE specific files
-.idea/
+# IDE
 .vscode/
+.idea/
 *.swp
 *.swo
 
-# OS generated files
+# OS
 .DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
-Thumbs.db 
+Thumbs.db
+
+# Azure
+.azure/ 
