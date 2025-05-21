@@ -23,9 +23,7 @@ jobs:
         node-version: ${{ env.NODE_VERSION }}
 
     - name: Install Node.js dependencies
-      run: |
-        npm ci
-        npm run build
+      run: npm ci
 
     - name: Create uploads and transcripts directories
       run: |
