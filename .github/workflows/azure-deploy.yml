@@ -23,12 +23,17 @@ jobs:
         node-version: ${{ env.NODE_VERSION }}
 
     - name: Install Node.js dependencies
-      run: npm ci
+      run: |
+        echo "Installing Node.js dependencies..."
+        npm ci
+        echo "Node.js dependencies installed successfully"
 
     - name: Create uploads and transcripts directories
       run: |
+        echo "Creating required directories..."
         mkdir -p uploads
         mkdir -p transcripts
+        echo "Directories created successfully"
 
     - name: Deploy to Azure Web App
       uses: azure/webapps-deploy@v2
@@ -36,8 +41,10 @@ jobs:
         app-name: ${{ env.AZURE_WEBAPP_NAME }}
         publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
         package: .
+        verbose: true
 
   deploy-functions:
+    needs: deploy-webapp
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v3
@@ -54,19 +61,32 @@ jobs:
 
     - name: Install Python dependencies for Functions
       run: |
+        echo "Installing Python dependencies..."
         cd azure-functions
         python -m pip install --upgrade pip
         pip install -r requirements.txt
+        echo "Python dependencies installed successfully"
 
     - name: Install Azure Functions Core Tools
       run: |
+        echo "Installing Azure Functions Core Tools..."
         curl https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor > microsoft.gpg
         sudo mv microsoft.gpg /etc/apt/trusted.gpg.d/microsoft.gpg
         sudo sh -c 'echo "deb [arch=amd64] https://packages.microsoft.com/repos/microsoft-ubuntu-$(lsb_release -cs)-prod $(lsb_release -cs) main" > /etc/apt/sources.list.d/dotnetdev.list'
         sudo apt-get update
-        sudo apt-get install azure-functions-core-tools-4
+        sudo apt-get install -y azure-functions-core-tools-4
+        echo "Azure Functions Core Tools installed successfully"
+
+    - name: List Function App contents
+      run: |
+        echo "Listing Function App contents..."
+        cd azure-functions
+        ls -la
+        echo "Function App contents listed"
 
     - name: Deploy to Azure Functions
       run: |
+        echo "Starting Function App deployment..."
         cd azure-functions
-        func azure functionapp publish ${{ env.AZURE_FUNCTIONAPP_NAME }} --python 
+        func azure functionapp publish ${{ env.AZURE_FUNCTIONAPP_NAME }} --python --verbose
+        echo "Function App deployment completed" 
