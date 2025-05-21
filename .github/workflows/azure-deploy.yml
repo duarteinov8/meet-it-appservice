@@ -63,6 +63,6 @@ jobs:
       with:
         app-name: ${{ env.AZURE_FUNCTIONAPP_NAME }}
         package: azure-functions
-        auth-level: function
         publish-profile: ${{ secrets.AZURE_FUNCTIONAPP_PUBLISH_PROFILE }}
-        creds: ${{ secrets.AZURE_CREDENTIALS }} 
+        enable-oryx-build: true
+        scm-do-build-during-deployment: true 
