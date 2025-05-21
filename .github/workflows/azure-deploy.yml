@@ -58,11 +58,15 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
 
+    - name: Install Azure Functions Core Tools
+      run: |
+        curl https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor > microsoft.gpg
+        sudo mv microsoft.gpg /etc/apt/trusted.gpg.d/microsoft.gpg
+        sudo sh -c 'echo "deb [arch=amd64] https://packages.microsoft.com/repos/microsoft-ubuntu-$(lsb_release -cs)-prod $(lsb_release -cs) main" > /etc/apt/sources.list.d/dotnetdev.list'
+        sudo apt-get update
+        sudo apt-get install azure-functions-core-tools-4
+
     - name: Deploy to Azure Functions
-      uses: Azure/functions-action@v1
-      with:
-        app-name: ${{ env.AZURE_FUNCTIONAPP_NAME }}
-        package: azure-functions
-        publish-profile: ${{ secrets.AZURE_FUNCTIONAPP_PUBLISH_PROFILE }}
-        enable-oryx-build: true
-        scm-do-build-during-deployment: true 
+      run: |
+        cd azure-functions
+        func azure functionapp publish ${{ env.AZURE_FUNCTIONAPP_NAME }} --python 
