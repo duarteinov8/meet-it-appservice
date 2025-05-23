@@ -8,14 +8,29 @@ const { supabase, getAuthenticatedClient, verifyAuth, saveTranscript, getTranscr
 const app = express();
 const port = process.env.PORT || 3000;
 require('dotenv').config();
+const os = require('os');
 
 // Health check endpoint for Azure App Service
 app.get('/health', (req, res) => {
-    res.status(200).json({
+    const health = {
         status: 'healthy',
         timestamp: new Date().toISOString(),
-        environment: process.env.NODE_ENV || 'development'
-    });
+        environment: process.env.NODE_ENV || 'development',
+        memory: process.memoryUsage(),
+        uptime: process.uptime(),
+        activeConnections: wss.clients.size,
+        pythonProcesses: Array.from(wss.clients).filter(client => client.pythonProcess).length
+    };
+    
+    // Check if we're close to memory limits
+    const used = process.memoryUsage();
+    const maxMemory = os.totalmem();
+    if (used.rss > maxMemory * 0.9) {
+        health.status = 'warning';
+        health.memoryWarning = 'High memory usage detected';
+    }
+    
+    res.status(200).json(health);
 });
 
 // Add startup logging with more details
@@ -107,32 +122,104 @@ server.on('error', (error) => {
     console.error('HTTP server error:', error);
 });
 
-// Add this function to safely manage Python processes
+// Add memory monitoring
+function logMemoryUsage() {
+    const used = process.memoryUsage();
+    console.log(`[${new Date().toISOString()}] Memory Usage:`, {
+        rss: `${Math.round(used.rss / 1024 / 1024)}MB`,
+        heapTotal: `${Math.round(used.heapTotal / 1024 / 1024)}MB`,
+        heapUsed: `${Math.round(used.heapUsed / 1024 / 1024)}MB`,
+        external: `${Math.round(used.external / 1024 / 1024)}MB`,
+        cpuUsage: process.cpuUsage()
+    });
+}
+
+// Monitor memory every 30 seconds
+setInterval(logMemoryUsage, 30000);
+
+// Add global error handlers
+process.on('uncaughtException', (error) => {
+    console.error(`[${new Date().toISOString()}] Uncaught Exception:`, error);
+    // Log memory usage at time of crash
+    logMemoryUsage();
+    // Give time for logging before exit
+    setTimeout(() => {
+        process.exit(1);
+    }, 1000);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error(`[${new Date().toISOString()}] Unhandled Rejection at:`, promise, 'reason:', reason);
+    // Log memory usage at time of rejection
+    logMemoryUsage();
+});
+
+// Add server error handling
+server.on('error', (error) => {
+    console.error(`[${new Date().toISOString()}] Server error:`, error);
+    logMemoryUsage();
+});
+
+// Modify the createPythonProcess function to include memory limits
 function createPythonProcess(args) {
     console.log(`[${new Date().toISOString()}] Starting Python process with args:`, args);
     
+    // Calculate memory limit (75% of available system memory)
+    const maxMemory = Math.floor(os.totalmem() * 0.75 / 1024 / 1024); // in MB
+    
     const pythonProcess = spawn('python', args, {
         stdio: ['pipe', 'pipe', 'pipe'],
-        windowsHide: true, // Hide the console window on Windows
-        detached: false   // Ensure the process is killed when Node exits
-    });
-
-    // Handle process errors
-    pythonProcess.on('error', (error) => {
-        console.error(`[${new Date().toISOString()}] Python process error:`, error);
-    });
-
-    // Handle process exit
-    pythonProcess.on('exit', (code, signal) => {
-        console.log(`[${new Date().toISOString()}] Python process exited with code ${code} and signal ${signal}`);
-        if (code !== 0 && code !== null) {
-            console.error(`[${new Date().toISOString()}] Python process exited with error code:`, code);
+        windowsHide: true,
+        detached: false,
+        env: {
+            ...process.env,
+            PYTHONUNBUFFERED: '1', // Ensure Python output isn't buffered
+            PYTHONIOENCODING: 'utf-8', // Ensure proper encoding
+            // Set memory limit for Python process
+            PYTHONMALLOC: 'malloc',
+            PYTHONMALLOCSTATS: '1'
         }
     });
 
-    // Handle process close
-    pythonProcess.on('close', (code, signal) => {
-        console.log(`[${new Date().toISOString()}] Python process closed with code ${code} and signal ${signal}`);
+    // Monitor Python process memory
+    let lastMemoryCheck = Date.now();
+    const memoryCheckInterval = setInterval(() => {
+        if (pythonProcess.killed) {
+            clearInterval(memoryCheckInterval);
+            return;
+        }
+
+        try {
+            const memoryUsage = process.memoryUsage();
+            if (memoryUsage.rss > maxMemory * 1024 * 1024) {
+                console.error(`[${new Date().toISOString()}] Python process exceeded memory limit`);
+                pythonProcess.kill('SIGTERM');
+            }
+        } catch (error) {
+            console.error(`[${new Date().toISOString()}] Error checking Python process memory:`, error);
+        }
+    }, 5000);
+
+    // Handle process errors with more detail
+    pythonProcess.on('error', (error) => {
+        console.error(`[${new Date().toISOString()}] Python process error:`, {
+            error: error.message,
+            code: error.code,
+            signal: error.signal,
+            memory: process.memoryUsage()
+        });
+        clearInterval(memoryCheckInterval);
+    });
+
+    // Handle process exit with more detail
+    pythonProcess.on('exit', (code, signal) => {
+        console.log(`[${new Date().toISOString()}] Python process exited:`, {
+            code,
+            signal,
+            memory: process.memoryUsage(),
+            uptime: process.uptime()
+        });
+        clearInterval(memoryCheckInterval);
     });
 
     // Handle stdout
@@ -775,25 +862,36 @@ server.listen(port, () => {
     console.log(`[${new Date().toISOString()}] Server running in ${process.env.NODE_ENV || 'development'} mode on port ${port}`);
 });
 
-// Add process exit handlers at the application level
-process.on('SIGTERM', () => {
-    console.log(`[${new Date().toISOString()}] Received SIGTERM signal`);
-    // Clean up any remaining Python processes
+// Add graceful shutdown
+async function gracefulShutdown(signal) {
+    console.log(`[${new Date().toISOString()}] Received ${signal}. Starting graceful shutdown...`);
+    
+    // Stop accepting new connections
+    server.close(() => {
+        console.log(`[${new Date().toISOString()}] HTTP server closed`);
+    });
+    
+    // Close all WebSocket connections
     wss.clients.forEach(client => {
         if (client.pythonProcess) {
-            client.pythonProcess.kill('SIGTERM');
+            try {
+                client.pythonProcess.kill('SIGTERM');
+            } catch (error) {
+                console.error(`[${new Date().toISOString()}] Error killing Python process:`, error);
+            }
         }
+        client.close();
     });
-    process.exit(0);
-});
+    
+    // Log final memory usage
+    logMemoryUsage();
+    
+    // Exit after cleanup
+    setTimeout(() => {
+        console.log(`[${new Date().toISOString()}] Shutdown complete. Exiting...`);
+        process.exit(0);
+    }, 5000);
+}
 
-process.on('SIGINT', () => {
-    console.log(`[${new Date().toISOString()}] Received SIGINT signal`);
-    // Clean up any remaining Python processes
-    wss.clients.forEach(client => {
-        if (client.pythonProcess) {
-            client.pythonProcess.kill('SIGTERM');
-        }
-    });
-    process.exit(0);
-});
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
