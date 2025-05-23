@@ -21,6 +21,7 @@ const port = process.env.PORT || 8080;
 const isNamedPipe = typeof port === 'string' && port.startsWith('\\\\.\\pipe\\');
 require('dotenv').config();
 const os = require('os');
+const http = require('http');
 
 // Health check endpoint for Azure App Service
 app.get('/health', (req, res) => {
@@ -117,23 +118,21 @@ const upload = multer({
     }
 }).single('audioFile');
 
-const WebSocket = require('ws');
-const http = require('http');
-
 // Create HTTP server
 const server = http.createServer(app);
 
-// Create WebSocket server
-const wss = new WebSocket.Server({ server });
-
-wss.on('error', (error) => {
-    console.error('WebSocket server error:', error);
-});
-
-// Add this for handling server errors
-server.on('error', (error) => {
-    console.error('HTTP server error:', error);
-});
+// Lazy initialize WebSocket server only when needed
+let wss = null;
+function getWebSocketServer() {
+    if (!wss) {
+        const WebSocket = require('ws');
+        wss = new WebSocket.Server({ server });
+        wss.on('error', (error) => {
+            console.error('WebSocket server error:', error);
+        });
+    }
+    return wss;
+}
 
 // Add memory monitoring
 function logMemoryUsage() {
@@ -248,157 +247,17 @@ function createPythonProcess(args) {
     return pythonProcess;
 }
 
-// Handle WebSocket connections
-wss.on('connection', async (ws) => {
-    console.log('[${new Date().toISOString()}] New WebSocket connection');
-    let currentUser = null;
-    let transcriptionBuffer = [];
-    let meetingStartTime = new Date();
-    let isAuthenticated = false;
-    let pythonProcess = null;
-
-    // Function to format transcription data
-    const formatTranscription = (transcriptions) => {
-        return transcriptions.map(t => `${t.speakerId}: ${t.text}`).join('\n');
-    };
-
-    // Function to save transcription to Supabase
-    const saveTranscriptionToSupabase = async (transcriptions) => {
-        if (!currentUser) {
-            console.log('No user logged in, skipping save');
-            return;
-        }
-
-        try {
-            const content = formatTranscription(transcriptions);
-            const duration = (new Date() - meetingStartTime) / 1000; // in seconds
-            
-            // Generate summary
-            let summary = '';
-            try {
-                summary = await generateMeetingSummary(content);
-            } catch (error) {
-                console.error('Error generating summary:', error);
-                summary = 'Error generating summary. Please try again.';
-            }
-            
-            await saveTranscript(currentUser.id, {
-                title: `Meeting ${new Date().toLocaleString()}`,
-                content: content,
-                summary: summary,
-                duration: Math.round(duration),
-                speakerCount: new Set(transcriptions.map(t => t.speakerId)).size,
-                audioUrl: null // We don't store audio files for live meetings
-            });
-
-            console.log('Transcription saved to Supabase');
-        } catch (error) {
-            console.error('Error saving transcription:', error);
-        }
-    };
-
-    // Handle user authentication
-    ws.on('message', async (message) => {
-        try {
-            const data = JSON.parse(message);
-            
-            if (data.type === 'auth') {
-                console.log('Received auth message');
-                
-                // Verify the token
-                const { data: { user }, error } = await supabase.auth.getUser(data.token);
-                if (error) {
-                    console.error('Auth error:', error);
-                    ws.send(JSON.stringify({ type: 'auth_response', error: 'Invalid token' }));
-                    ws.close();
-                    return;
-                }
-
-                // If token is invalid, try to refresh it
-                if (error && error.message.includes('invalid token')) {
-                    console.log('Token invalid, attempting to refresh...');
-                    const { data: { session }, error: refreshError } = await supabase.auth.refreshSession();
-                    
-                    if (refreshError) {
-                        console.error('Error refreshing session:', refreshError);
-                        ws.send(JSON.stringify({ type: 'auth_response', error: 'Failed to refresh token' }));
-                        ws.close();
-                        return;
-                    }
-                    
-                    if (!session) {
-                        ws.send(JSON.stringify({ type: 'auth_response', error: 'No session after refresh' }));
-                        ws.close();
-                        return;
-                    }
-                    
-                    // Try to get user with new token
-                    const { data: { user: refreshedUser }, error: userError } = await supabase.auth.getUser(session.access_token);
-                    if (userError) {
-                        ws.send(JSON.stringify({ type: 'auth_response', error: 'Failed to get user after refresh' }));
-                        ws.close();
-                        return;
-                    }
-                    
-                    user = refreshedUser;
-                }
-
-                currentUser = user;
-                isAuthenticated = true;
-                console.log('User authenticated:', user.email);
-                
-                // Send success response
-                ws.send(JSON.stringify({ 
-                    type: 'auth_response',
-                    success: true,
-                    user: {
-                        id: user.id,
-                        email: user.email
-                    }
-                }));
-
-                // Start Python process after successful authentication using the new function
-                pythonProcess = createPythonProcess(['enroll_speakers.py', '--live']);
-                ws.pythonProcess = pythonProcess;
-            }
-        } catch (error) {
-            console.error(`[${new Date().toISOString()}] Error handling message:`, error);
-            if (!isAuthenticated) {
-                ws.send(JSON.stringify({ type: 'auth_response', error: 'Invalid message format' }));
-                ws.close();
-            }
+// Modify the WebSocket connection handler to use lazy initialization
+app.ws = function(path, handler) {
+    if (!wss) {
+        wss = getWebSocketServer();
+    }
+    wss.on('connection', (ws, req) => {
+        if (req.url === path) {
+            handler(ws, req);
         }
     });
-
-    ws.on('close', async () => {
-        console.log(`[${new Date().toISOString()}] WebSocket connection closed`);
-        
-        // Save any remaining transcriptions
-        if (transcriptionBuffer.length > 0 && currentUser) {
-            await saveTranscriptionToSupabase(transcriptionBuffer);
-        }
-
-        // Properly kill the Python process
-        if (ws.pythonProcess) {
-            try {
-                console.log(`[${new Date().toISOString()}] Terminating Python process`);
-                ws.pythonProcess.kill('SIGTERM'); // Try graceful termination first
-                
-                // Force kill after 5 seconds if still running
-                setTimeout(() => {
-                    if (ws.pythonProcess) {
-                        console.log(`[${new Date().toISOString()}] Force killing Python process`);
-                        ws.pythonProcess.kill('SIGKILL');
-                    }
-                }, 5000);
-            } catch (error) {
-                console.error(`[${new Date().toISOString()}] Error killing Python process:`, error);
-            }
-        }
-    });
-});
-
-app.use(express.json());  // Add this line for parsing JSON bodies
+};
 
 // Add authentication middleware
 const authenticateUser = async (req, res, next) => {
@@ -524,11 +383,7 @@ async function generateMeetingSummary(transcript) {
     }
 }
 
-// Serve static files
-app.use(express.static('public'));
-app.use('/uploads', express.static('uploads'));
-
-// Convert your index.html to index.ejs
+// Basic route for homepage
 app.get('/', (req, res) => {
     res.render('index', {
         process: {
@@ -870,18 +725,15 @@ process.on('uncaughtException', (error) => {
 // Add this before starting the server
 console.log('About to start server...');
 
-// Start the server
-if (isNamedPipe) {
-    // For named pipes, we need to use the pipe name directly
-    server.listen(port, () => {
-        console.log(`[${new Date().toISOString()}] Server running in ${process.env.NODE_ENV || 'development'} mode on named pipe ${port}`);
-    });
-} else {
-    // For standard ports, bind to all interfaces
-    server.listen(port, '0.0.0.0', () => {
-        console.log(`[${new Date().toISOString()}] Server running in ${process.env.NODE_ENV || 'development'} mode on port ${port}`);
-    });
-}
+// Start server with error handling
+server.listen(port, '0.0.0.0', () => {
+    console.log(`Server running on ${isNamedPipe ? 'named pipe' : 'port ' + port}`);
+    // Log memory usage after startup
+    logMemoryUsage();
+}).on('error', (error) => {
+    console.error('Server failed to start:', error);
+    process.exit(1);
+});
 
 // Add graceful shutdown
 async function gracefulShutdown(signal) {
