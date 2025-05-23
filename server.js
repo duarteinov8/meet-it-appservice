@@ -1,3 +1,14 @@
+// Add this at the very top of the file, before any other requires
+process.removeAllListeners('warning');
+process.on('warning', (warning) => {
+    // Suppress only the Buffer deprecation warning
+    if (warning.name === 'DeprecationWarning' && warning.message.includes('Buffer()')) {
+        return;
+    }
+    // Log all other warnings
+    console.warn(`[${new Date().toISOString()}] Warning:`, warning);
+});
+
 const express = require('express');
 const multer = require('multer');
 const path = require('path');
