@@ -18,6 +18,7 @@ const OpenAI = require('openai');
 const { supabase, getAuthenticatedClient, verifyAuth, saveTranscript, getTranscripts, createMeeting, getMeetings } = require('./config/supabase');
 const app = express();
 const port = process.env.PORT || 8080;
+const isNamedPipe = typeof port === 'string' && port.startsWith('\\\\.\\pipe\\');
 require('dotenv').config();
 const os = require('os');
 
@@ -48,7 +49,8 @@ app.get('/health', (req, res) => {
 console.log('=== Application Starting ===');
 console.log('Node Version:', process.version);
 console.log('Environment:', process.env.NODE_ENV || 'development');
-console.log('Port:', process.env.PORT || 8080);
+console.log('Port:', port);
+console.log('Connection Type:', isNamedPipe ? 'Named Pipe' : 'TCP Port');
 console.log('=== Environment Check ===');
 console.log('SUPABASE_URL:', process.env.SUPABASE_URL ? '✓ Set' : '✗ Missing');
 console.log('SUPABASE_ANON_KEY:', process.env.SUPABASE_ANON_KEY ? '✓ Set' : '✗ Missing');
@@ -869,9 +871,17 @@ process.on('uncaughtException', (error) => {
 console.log('About to start server...');
 
 // Start the server
-server.listen(port, '0.0.0.0', () => {
-    console.log(`[${new Date().toISOString()}] Server running in ${process.env.NODE_ENV || 'development'} mode on port ${port}`);
-});
+if (isNamedPipe) {
+    // For named pipes, we need to use the pipe name directly
+    server.listen(port, () => {
+        console.log(`[${new Date().toISOString()}] Server running in ${process.env.NODE_ENV || 'development'} mode on named pipe ${port}`);
+    });
+} else {
+    // For standard ports, bind to all interfaces
+    server.listen(port, '0.0.0.0', () => {
+        console.log(`[${new Date().toISOString()}] Server running in ${process.env.NODE_ENV || 'development'} mode on port ${port}`);
+    });
+}
 
 // Add graceful shutdown
 async function gracefulShutdown(signal) {
