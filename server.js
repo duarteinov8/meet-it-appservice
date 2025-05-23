@@ -107,13 +107,55 @@ server.on('error', (error) => {
     console.error('HTTP server error:', error);
 });
 
+// Add this function to safely manage Python processes
+function createPythonProcess(args) {
+    console.log(`[${new Date().toISOString()}] Starting Python process with args:`, args);
+    
+    const pythonProcess = spawn('python', args, {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: true, // Hide the console window on Windows
+        detached: false   // Ensure the process is killed when Node exits
+    });
+
+    // Handle process errors
+    pythonProcess.on('error', (error) => {
+        console.error(`[${new Date().toISOString()}] Python process error:`, error);
+    });
+
+    // Handle process exit
+    pythonProcess.on('exit', (code, signal) => {
+        console.log(`[${new Date().toISOString()}] Python process exited with code ${code} and signal ${signal}`);
+        if (code !== 0 && code !== null) {
+            console.error(`[${new Date().toISOString()}] Python process exited with error code:`, code);
+        }
+    });
+
+    // Handle process close
+    pythonProcess.on('close', (code, signal) => {
+        console.log(`[${new Date().toISOString()}] Python process closed with code ${code} and signal ${signal}`);
+    });
+
+    // Handle stdout
+    pythonProcess.stdout.on('data', (data) => {
+        console.log(`[${new Date().toISOString()}] Python stdout:`, data.toString().trim());
+    });
+
+    // Handle stderr
+    pythonProcess.stderr.on('data', (data) => {
+        console.error(`[${new Date().toISOString()}] Python stderr:`, data.toString().trim());
+    });
+
+    return pythonProcess;
+}
+
 // Handle WebSocket connections
 wss.on('connection', async (ws) => {
-    console.log('New WebSocket connection');
+    console.log('[${new Date().toISOString()}] New WebSocket connection');
     let currentUser = null;
     let transcriptionBuffer = [];
     let meetingStartTime = new Date();
     let isAuthenticated = false;
+    let pythonProcess = null;
 
     // Function to format transcription data
     const formatTranscription = (transcriptions) => {
@@ -215,61 +257,12 @@ wss.on('connection', async (ws) => {
                     }
                 }));
 
-                // Start Python process after successful authentication
-                const pythonProcess = spawn('python', ['enroll_speakers.py', '--live']);
-
-                pythonProcess.stdout.on('data', (data) => {
-                    if (!isAuthenticated) return; // Don't process data if not authenticated
-                    
-                    const output = data.toString();
-                    console.log('Python output:', output);
-                    
-                    try {
-                        // Check for transcription data
-                        if (output.includes('TRANSCRIBED:') || output.includes('TRANSCRIBING:')) {
-                            // Extract text and speaker ID using more robust regex
-                            const textMatch = output.match(/Text=([^\n]+)/);
-                            const speakerMatch = output.match(/Speaker ID=([^\n]+)/);
-                            
-                            if (textMatch && speakerMatch) {
-                                const transcription = {
-                                    text: textMatch[1].trim(),
-                                    speakerId: speakerMatch[1].trim(),
-                                    type: output.includes('TRANSCRIBED:') ? 'final' : 'interim',
-                                    timestamp: new Date()
-                                };
-                                
-                                if (ws.readyState === WebSocket.OPEN) {
-                                    ws.send(JSON.stringify(transcription));
-                                    console.log('Sent transcription:', transcription);
-
-                                    // If it's a final transcription, add it to the buffer
-                                    if (transcription.type === 'final') {
-                                        transcriptionBuffer.push(transcription);
-                                        
-                                        // Save to Supabase every 10 final transcriptions
-                                        if (transcriptionBuffer.length >= 10) {
-                                            saveTranscriptionToSupabase(transcriptionBuffer);
-                                            transcriptionBuffer = []; // Clear the buffer
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    } catch (error) {
-                        console.error('Error processing transcription:', error);
-                    }
-                });
-
-                pythonProcess.stderr.on('data', (data) => {
-                    console.error('Python error:', data.toString());
-                });
-
-                // Store the Python process in the WebSocket object for cleanup
+                // Start Python process after successful authentication using the new function
+                pythonProcess = createPythonProcess(['enroll_speakers.py', '--live']);
                 ws.pythonProcess = pythonProcess;
             }
         } catch (error) {
-            console.error('Error handling message:', error);
+            console.error(`[${new Date().toISOString()}] Error handling message:`, error);
             if (!isAuthenticated) {
                 ws.send(JSON.stringify({ type: 'auth_response', error: 'Invalid message format' }));
                 ws.close();
@@ -278,14 +271,29 @@ wss.on('connection', async (ws) => {
     });
 
     ws.on('close', async () => {
-        console.log('WebSocket connection closed');
+        console.log(`[${new Date().toISOString()}] WebSocket connection closed`);
+        
         // Save any remaining transcriptions
         if (transcriptionBuffer.length > 0 && currentUser) {
             await saveTranscriptionToSupabase(transcriptionBuffer);
         }
-        // Kill the Python process if it exists
+
+        // Properly kill the Python process
         if (ws.pythonProcess) {
-            ws.pythonProcess.kill();
+            try {
+                console.log(`[${new Date().toISOString()}] Terminating Python process`);
+                ws.pythonProcess.kill('SIGTERM'); // Try graceful termination first
+                
+                // Force kill after 5 seconds if still running
+                setTimeout(() => {
+                    if (ws.pythonProcess) {
+                        console.log(`[${new Date().toISOString()}] Force killing Python process`);
+                        ws.pythonProcess.kill('SIGKILL');
+                    }
+                }, 5000);
+            } catch (error) {
+                console.error(`[${new Date().toISOString()}] Error killing Python process:`, error);
+            }
         }
     });
 });
@@ -494,11 +502,11 @@ app.post('/generate-summary', async (req, res) => {
     }
 });
 
-// Modify the upload endpoint to save to Supabase
+// Modify the upload endpoint to use the new function
 app.post('/upload', authenticateUser, async (req, res) => {
     upload(req, res, async function (err) {
         if (err) {
-            console.error('Upload error:', err);
+            console.error(`[${new Date().toISOString()}] Upload error:`, err);
             return res.status(500).json({ error: `Upload error: ${err.message}` });
         }
 
@@ -507,8 +515,8 @@ app.post('/upload', authenticateUser, async (req, res) => {
         }
 
         try {
-            // Process with Python script as before
-            const pythonProcess = spawn('python', [
+            // Process with Python script using the new function
+            const pythonProcess = createPythonProcess([
                 'enroll_speakers.py',
                 path.join(__dirname, 'uploads', req.file.filename)
             ]);
@@ -558,7 +566,7 @@ app.post('/upload', authenticateUser, async (req, res) => {
                 });
             });
         } catch (error) {
-            console.error('Error processing file:', error);
+            console.error(`[${new Date().toISOString()}] Error processing file:`, error);
             res.status(500).json({ error: 'Error processing file' });
         }
     });
@@ -765,4 +773,27 @@ console.log('About to start server...');
 // Start the server
 server.listen(port, () => {
     console.log(`[${new Date().toISOString()}] Server running in ${process.env.NODE_ENV || 'development'} mode on port ${port}`);
+});
+
+// Add process exit handlers at the application level
+process.on('SIGTERM', () => {
+    console.log(`[${new Date().toISOString()}] Received SIGTERM signal`);
+    // Clean up any remaining Python processes
+    wss.clients.forEach(client => {
+        if (client.pythonProcess) {
+            client.pythonProcess.kill('SIGTERM');
+        }
+    });
+    process.exit(0);
+});
+
+process.on('SIGINT', () => {
+    console.log(`[${new Date().toISOString()}] Received SIGINT signal`);
+    // Clean up any remaining Python processes
+    wss.clients.forEach(client => {
+        if (client.pythonProcess) {
+            client.pythonProcess.kill('SIGTERM');
+        }
+    });
+    process.exit(0);
 });
