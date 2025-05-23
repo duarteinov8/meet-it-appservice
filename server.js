@@ -18,55 +18,6 @@ app.get('/health', (req, res) => {
     });
 });
 
-// Add production logging
-if (process.env.NODE_ENV === 'production') {
-    const winston = require('winston');
-    const logger = winston.createLogger({
-        level: 'info',
-        format: winston.format.combine(
-            winston.format.timestamp(),
-            winston.format.printf(({ timestamp, level, message, ...meta }) => {
-                return `${timestamp} [${level.toUpperCase()}]: ${message} ${Object.keys(meta).length ? JSON.stringify(meta) : ''}`;
-            })
-        ),
-        defaultMeta: { service: 'meeting-transcription' },
-        transports: [
-            // Console transport for Azure App Service logging
-            new winston.transports.Console({
-                format: winston.format.simple(),
-                handleExceptions: true,
-                handleRejections: true
-            })
-        ],
-        // Add exception handling
-        exceptionHandlers: [
-            new winston.transports.Console({
-                format: winston.format.simple()
-            })
-        ],
-        rejectionHandlers: [
-            new winston.transports.Console({
-                format: winston.format.simple()
-            })
-        ]
-    });
-    
-    // Override console methods to ensure all logs go through winston
-    console.log = (...args) => logger.info.call(logger, ...args);
-    console.error = (...args) => logger.error.call(logger, ...args);
-    console.warn = (...args) => logger.warn.call(logger, ...args);
-    console.info = (...args) => logger.info.call(logger, ...args);
-
-    // Add unhandled exception logging
-    process.on('unhandledRejection', (reason, promise) => {
-        logger.error('Unhandled Rejection at:', promise, 'reason:', reason);
-    });
-
-    process.on('uncaughtException', (error) => {
-        logger.error('Uncaught Exception:', error);
-    });
-}
-
 // Add startup logging with more details
 console.log('=== Application Starting ===');
 console.log('Node Version:', process.version);
@@ -789,20 +740,29 @@ app.post('/api/users', async (req, res) => {
 
 // Add request logging middleware
 app.use((req, res, next) => {
-    console.log(`${new Date().toISOString()} ${req.method} ${req.url}`);
+    console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
     next();
 });
 
 // Add error logging middleware
 app.use((err, req, res, next) => {
-    console.error('Error:', err);
+    console.error(`[${new Date().toISOString()}] Error:`, err);
     next(err);
 });
 
-// Add console.log to show server is starting
-console.log('Starting server...');
+// Add unhandled exception logging
+process.on('unhandledRejection', (reason, promise) => {
+    console.error(`[${new Date().toISOString()}] Unhandled Rejection at:`, promise, 'reason:', reason);
+});
+
+process.on('uncaughtException', (error) => {
+    console.error(`[${new Date().toISOString()}] Uncaught Exception:`, error);
+});
+
+// Add this before starting the server
+console.log('About to start server...');
 
 // Start the server
 server.listen(port, () => {
-    console.log(`Server running in ${process.env.NODE_ENV || 'development'} mode on port ${port}`);
+    console.log(`[${new Date().toISOString()}] Server running in ${process.env.NODE_ENV || 'development'} mode on port ${port}`);
 });
